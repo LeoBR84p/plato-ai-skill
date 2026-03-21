@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# API keys and secrets — NEVER commit
+*.key
+*.pem
+*.p12
+*.json.secret
+*service_account*.json
+*credentials*.json
+*client_secret*.json
+.env
+.env.*
+keys/
+
+# Research workspaces (may contain PII / unpublished data)
+research-workspace/
+
+# LangSmith / LangChain local cache
+.langchain.db
