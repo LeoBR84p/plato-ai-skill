@@ -16,7 +16,6 @@ Parameters accepted in SkillInput.parameters:
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -129,25 +128,69 @@ class ContentSummarizerSkill(BaseSkill):
             self._llm = LLMClient()
         return self._llm
 
+    @staticmethod
+    def _fetch_text(url: str, timeout: int = 10) -> str:
+        """Fetch plain text from *url* using BeautifulSoup for proper HTML parsing.
+
+        Removes script, style, nav and footer elements before extracting text
+        to avoid JavaScript, CSS, and navigation noise in the summarised content.
+        Returns empty string on any failure.
+        """
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; ai-skill-summarizer/1.0)"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(65536)
+                html = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            return soup.get_text(separator=" ", strip=True)
+        except Exception:
+            # Fallback to basic regex stripping if BeautifulSoup fails
+            import re
+            text = re.sub(r"<[^>]+>", " ", html)
+            text = re.sub(r"\s{2,}", " ", text)
+            return text.strip()
+
     def run(self, input: SkillInput) -> SkillOutput:
         """Summarise the provided content.
 
+        When *content* is absent but *source_url* is supplied, the skill
+        fetches the URL automatically and uses the retrieved text as content.
+
         Args:
-            input: SkillInput with parameters: content (required), content_type,
-                max_length, focus_areas, source_url, source_year.
+            input: SkillInput with parameters: content (text to summarise) or
+                source_url (auto-fetched when content is absent), content_type,
+                max_length, focus_areas, source_year.
 
         Returns:
             SkillOutput with result containing the SummaryOutput fields.
         """
         params = input.parameters
         content: str | None = params.get("content")
+        source_url: str = params.get("source_url", "")
+
         if not content or not content.strip():
-            return self._error_output("Parameter 'content' is required and must not be empty.")
+            if source_url:
+                content = self._fetch_text(source_url)
+            if not content or not content.strip():
+                return self._error_output(
+                    "Parameter 'content' is required (or provide 'source_url' for auto-fetch). "
+                    f"URL fetch {'returned empty' if source_url else 'not attempted'}."
+                )
 
         content_type: str = params.get("content_type", "text")
         max_length: int = int(params.get("max_length", 200))
         focus_areas: list[str] = params.get("focus_areas", [])
-        source_url: str = params.get("source_url", "")
         source_year: int | None = params.get("source_year")
 
         # Determine research topic for relevance scoring

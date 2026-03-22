@@ -144,7 +144,7 @@ def build_cp2_graph() -> "CompiledGraph":  # type: ignore[name-defined]
     )
     builder.add_edge("refine_literature", "verify_literature")
 
-    return builder.compile(interrupt_before=["review_literature"])
+    return builder.compile(interrupt_before=["review_literature", "request_support"])
 
 
 def get_graph_mermaid() -> str:

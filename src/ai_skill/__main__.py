@@ -2,6 +2,7 @@
 
 Commands:
     workspace begin            Create a new research project workspace (interactive wizard).
+    begin-workspace            Alias for 'workspace begin'.
     workspace list             List all existing workspaces.
     workspace files [name]     List files available inside a workspace.
     research <topic>           Start a new research pipeline for the given topic.
@@ -227,9 +228,18 @@ def workspace_files(
 # ---------------------------------------------------------------------------
 
 
+@app.command("begin-workspace")
+def begin_workspace_alias() -> None:
+    """Criar um novo workspace de pesquisa (alias de 'workspace begin')."""
+    workspace_begin()
+
+
 @app.command("begin-research")
 def begin_research(
-    topic: Annotated[str, typer.Argument(help="Research topic or question.")],
+    topic: Annotated[
+        str,
+        typer.Argument(help="Research topic or question. If omitted, you will be prompted."),
+    ] = "",
     workspace: Annotated[
         Path | None,
         typer.Option("--workspace", "-w", help="Custom workspace directory."),
@@ -245,7 +255,34 @@ def begin_research(
     if model:
         os.environ["AI_SKILL_MODEL"] = model
 
-    ws_path = workspace or _default_workspace(topic)
+    # --- Interactive workspace + topic selection when arguments are omitted ---
+    if workspace is None or not topic.strip():
+        console.print(Panel("[bold]Novo Research Charter — CP1[/bold]", expand=False))
+
+    if workspace is None:
+        workspace = _pick_workspace_for_research()
+        if workspace is None:
+            raise typer.Exit(0)
+
+    # Pre-fill topic from workspace.yaml when not provided on the command line
+    if not topic.strip():
+        _pre = _topic_from_workspace(workspace)
+        prompt_default = _pre if _pre else ""
+        while True:
+            entered = typer.prompt(
+                "\nTópico ou questão de pesquisa",
+                default=prompt_default if prompt_default else ...,  # type: ignore[arg-type]
+            ).strip()
+            if entered:
+                topic = entered
+                break
+            console.print("[red]O tópico não pode ser vazio.[/red]")
+        console.print(f"\n  [dim]→[/dim] [bold]{topic}[/bold]")
+        if not typer.confirm("Confirmar?", default=True):
+            console.print("[dim]Operação cancelada.[/dim]")
+            raise typer.Exit(0)
+
+    ws_path = workspace
 
     # If the given path is a ProjectWorkspace, keep research artefacts inside
     # it but store the LangGraph internal state under <project>/.state/
@@ -277,7 +314,7 @@ def begin_research(
                     ws.save_state(current_state)
                     _handle_checkpoint(node_output, current_state, state_path)
                     return
-                _print_node_progress(node_name, node_output)
+                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])))
                 if isinstance(node_output, dict):
                     current_state.update(node_output)
                     ws.save_state(current_state)  # persist after every node
@@ -296,16 +333,20 @@ def begin_research(
 @app.command()
 def status(
     workspace: Annotated[
-        Path,
+        Path | None,
         typer.Option("--workspace", "-w", help="Workspace directory to inspect."),
-    ] = Path("./research-workspace"),
+    ] = None,
 ) -> None:
     """Show the current status of an existing research workspace."""
     _configure_logging()
 
     from ai_skill.core.workspace import ResearchWorkspace
 
-    ws = ResearchWorkspace(workspace)
+    ws_path = _resolve_workspace_path(workspace, state_subdir=True)
+    if ws_path is None:
+        raise typer.Exit(1)
+
+    ws = ResearchWorkspace(ws_path)
     state = ws.load_state()
     if state is None:
         console.print(f"[red]No research state found in:[/red] {workspace}")
@@ -323,9 +364,9 @@ def status(
 @app.command()
 def resume(
     workspace: Annotated[
-        Path,
+        Path | None,
         typer.Option("--workspace", "-w", help="Workspace directory to resume."),
-    ] = Path("./research-workspace"),
+    ] = None,
     correct: Annotated[
         bool,
         typer.Option(
@@ -345,6 +386,11 @@ def resume(
 
     from ai_skill.core.graph import build_cp1_graph, build_cp2_graph
     from ai_skill.core.workspace import ResearchWorkspace
+
+    ws_path = _resolve_workspace_path(workspace, state_subdir=True)
+    if ws_path is None:
+        raise typer.Exit(1)
+    workspace = ws_path
 
     ws = ResearchWorkspace(workspace)
     state = ws.load_state()
@@ -415,7 +461,7 @@ def resume(
         )
         if not typer.confirm(
             "Deseja continuar e gerar um novo preview a partir do arquivo final?",
-            default=False,
+            default=True,
         ):
             console.print("[dim]Operação cancelada.[/dim]")
             raise typer.Exit(0)
@@ -458,7 +504,7 @@ def resume(
                     ws.save_state(current_state)
                     _handle_checkpoint(node_output, current_state, workspace)
                     return
-                _print_node_progress(node_name, node_output)
+                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])))
                 if isinstance(node_output, dict):
                     current_state.update(node_output)
                     ws.save_state(current_state)
@@ -476,12 +522,12 @@ def resume(
 @app.command("begin-literature")
 def begin_literature(
     workspace: Annotated[
-        Path,
+        Path | None,
         typer.Option(
             "--workspace", "-w",
             help="ProjectWorkspace ou diretório .state/ do projeto.",
         ),
-    ] = Path("./research-workspace"),
+    ] = None,
 ) -> None:
     """Iniciar a Revisão Bibliográfica (Checkpoint 2).
 
@@ -490,13 +536,18 @@ def begin_literature(
     """
     _configure_logging(os.environ.get("AI_SKILL_LOG_LEVEL", "WARNING"))
 
-    # --- Resolve project path and state path ---
-    if (workspace / "workspace.yaml").exists():
-        project_path = workspace
-        state_path = workspace / ".state"
-    elif (workspace.parent / "workspace.yaml").exists():
-        project_path = workspace.parent
-        state_path = workspace
+    # --- Resolve project path (interactive picker when --workspace omitted) ---
+    resolved = _resolve_workspace_path(workspace, state_subdir=False)
+    if resolved is None:
+        raise typer.Exit(1)
+
+    # Accept both project root and .state/ as input
+    if (resolved / "workspace.yaml").exists():
+        project_path = resolved
+        state_path = resolved / ".state"
+    elif (resolved.parent / "workspace.yaml").exists():
+        project_path = resolved.parent
+        state_path = resolved
     else:
         console.print(
             "[red]Workspace não reconhecido.[/red]\n"
@@ -564,7 +615,7 @@ def begin_literature(
                     ws.save_state(current_state)
                     _handle_checkpoint(node_output, current_state, state_path)
                     return
-                _print_node_progress(node_name, node_output)
+                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])))
                 if isinstance(node_output, dict):
                     current_state.update(node_output)
                     ws.save_state(current_state)
@@ -652,6 +703,152 @@ def skills_show(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_workspace_path(given: Path | None, *, state_subdir: bool) -> Path | None:
+    """Return a workspace path, falling back to an interactive picker when *given* is None.
+
+    Args:
+        given: The path supplied by the user via ``--workspace``, or None.
+        state_subdir: When True, return ``project_path / ".state"`` (for commands
+            that hand the path to :class:`ResearchWorkspace`).  When False,
+            return the project root (for commands that detect the layout themselves).
+
+    Returns:
+        The resolved path, or None if the user cancelled or no workspaces exist.
+    """
+    if given is not None:
+        return given
+
+    from ai_skill.core.project_workspace import default_projects_root, list_workspaces
+
+    root = default_projects_root()
+    workspaces = list_workspaces(root)
+
+    if not workspaces:
+        console.print(f"[red]Nenhum workspace encontrado em:[/red] {root}")
+        console.print("[dim]Crie um com:[/dim]  ai-skill workspace begin")
+        return None
+
+    console.print("\n[bold]Workspaces disponíveis:[/bold]\n")
+    for i, ws in enumerate(workspaces, start=1):
+        meta = ws.load_metadata()
+        name = meta.get("name", ws.slug)
+        topic = meta.get("topic", "?")
+        cp = meta.get("current_checkpoint", 0)
+        st = meta.get("status", "?")
+        topic_short = topic[:52] + "…" if len(topic) > 52 else topic
+        console.print(
+            f"  [cyan]{i:>2}.[/cyan] [bold]{name}[/bold]  "
+            f"[dim]CP{cp} · {st}[/dim]\n"
+            f"       [dim]{topic_short}[/dim]\n"
+        )
+
+    raw = typer.prompt("Número do workspace").strip()
+    try:
+        idx = int(raw) - 1
+        if not (0 <= idx < len(workspaces)):
+            console.print("[red]Número inválido.[/red]")
+            return None
+    except ValueError:
+        console.print("[red]Entrada inválida.[/red]")
+        return None
+
+    selected = workspaces[idx]
+    console.print(f"\n  [dim]→[/dim] [bold]{selected.path}[/bold]")
+    if not typer.confirm("Confirmar?", default=True):
+        console.print("[dim]Operação cancelada.[/dim]")
+        return None
+
+    return selected.path / ".state" if state_subdir else selected.path
+
+
+def _pick_workspace_for_research() -> Path | None:
+    """List existing ProjectWorkspaces (plus a 'create new' option) for begin-research.
+
+    Returns the selected project root path, or None if the user cancels.
+    """
+    from ai_skill.core.project_workspace import ProjectWorkspace, default_projects_root, list_workspaces, slugify
+
+    root = default_projects_root()
+    workspaces = list_workspaces(root)
+
+    console.print("\n[bold]Selecione um workspace:[/bold]\n")
+    console.print("   [cyan] 0.[/cyan] [green]+ Criar novo workspace[/green]\n")
+    for i, ws in enumerate(workspaces, start=1):
+        meta = ws.load_metadata()
+        name = meta.get("name", ws.slug)
+        topic = meta.get("topic", "?")
+        cp = meta.get("current_checkpoint", 0)
+        st = meta.get("status", "?")
+        topic_short = topic[:52] + "…" if len(topic) > 52 else topic
+        console.print(
+            f"  [cyan]{i:>2}.[/cyan] [bold]{name}[/bold]  "
+            f"[dim]CP{cp} · {st}[/dim]\n"
+            f"       [dim]{topic_short}[/dim]\n"
+        )
+
+    raw = typer.prompt("Número").strip()
+    try:
+        idx = int(raw)
+    except ValueError:
+        console.print("[red]Entrada inválida.[/red]")
+        return None
+
+    if idx == 0:
+        # Create new workspace
+        console.print()
+        while True:
+            raw_name = typer.prompt("Nome da pesquisa").strip()
+            if not raw_name:
+                console.print("[red]Nome não pode ser vazio.[/red]")
+                continue
+            try:
+                slugify(raw_name)
+            except ValueError as exc:
+                console.print(f"[red]{exc}[/red]")
+                continue
+            break
+        ws_new = ProjectWorkspace(raw_name, root=root)
+        if not ws_new.exists():
+            ws_new.create(topic="")
+            console.print(f"  [green]✓[/green] Workspace criado: [bold]{ws_new.path}[/bold]")
+        console.print(f"\n  [dim]→[/dim] [bold]{ws_new.path}[/bold]")
+        if not typer.confirm("Confirmar?", default=True):
+            console.print("[dim]Operação cancelada.[/dim]")
+            return None
+        return ws_new.path
+
+    if not (1 <= idx <= len(workspaces)):
+        console.print("[red]Número inválido.[/red]")
+        return None
+
+    selected = workspaces[idx - 1]
+    console.print(f"\n  [dim]→[/dim] [bold]{selected.path}[/bold]")
+    if not typer.confirm("Confirmar?", default=True):
+        console.print("[dim]Operação cancelada.[/dim]")
+        return None
+    return selected.path
+
+
+def _topic_from_workspace(ws_path: Path) -> str:
+    """Return the topic stored in workspace.yaml, or empty string if unavailable.
+
+    Args:
+        ws_path: Root of the ProjectWorkspace.
+
+    Returns:
+        Topic string, or empty string.
+    """
+    meta_file = ws_path / "workspace.yaml"
+    if not meta_file.exists():
+        return ""
+    try:
+        import yaml as _yaml
+        meta = _yaml.safe_load(meta_file.read_text(encoding="utf-8")) or {}
+        return str(meta.get("topic", "")).strip()
+    except Exception:
+        return ""
+
+
 def _resolve_workspace(name: str | None) -> "ProjectWorkspace | None":  # noqa: F821
     """Resolve a ProjectWorkspace by name or interactive selection.
 
@@ -680,23 +877,44 @@ def _resolve_workspace(name: str | None) -> "ProjectWorkspace | None":  # noqa: 
         return None
 
     if len(workspaces) == 1:
-        return workspaces[0]
+        selected = workspaces[0]
+        meta = selected.load_metadata()
+        console.print(f"\n  [dim]→[/dim] [bold]{meta.get('name', selected.slug)}[/bold]  {selected.path}")
+        if not typer.confirm("Confirmar?", default=True):
+            console.print("[dim]Operação cancelada.[/dim]")
+            return None
+        return selected
 
-    console.print("\n[bold]Workspaces disponíveis:[/bold]")
+    console.print("\n[bold]Workspaces disponíveis:[/bold]\n")
     for i, ws in enumerate(workspaces, start=1):
         meta = ws.load_metadata()
-        console.print(f"  [cyan]{i}.[/cyan] {meta.get('name', ws.slug)}")
+        name = meta.get("name", ws.slug)
+        topic = meta.get("topic", "?")
+        cp = meta.get("current_checkpoint", 0)
+        st = meta.get("status", "?")
+        topic_short = topic[:52] + "…" if len(topic) > 52 else topic
+        console.print(
+            f"  [cyan]{i:>2}.[/cyan] [bold]{name}[/bold]  "
+            f"[dim]CP{cp} · {st}[/dim]\n"
+            f"       [dim]{topic_short}[/dim]\n"
+        )
 
-    raw = typer.prompt("\nEscolha o número do workspace", default="1")
+    raw = typer.prompt("Número do workspace").strip()
     try:
         idx = int(raw) - 1
-        if 0 <= idx < len(workspaces):
-            return workspaces[idx]
-        console.print("[red]Número inválido.[/red]")
-        return None
+        if not (0 <= idx < len(workspaces)):
+            console.print("[red]Número inválido.[/red]")
+            return None
     except ValueError:
         console.print("[red]Entrada inválida.[/red]")
         return None
+
+    selected = workspaces[idx]
+    console.print(f"\n  [dim]→[/dim] [bold]{selected.path}[/bold]")
+    if not typer.confirm("Confirmar?", default=True):
+        console.print("[dim]Operação cancelada.[/dim]")
+        return None
+    return selected
 
 
 def prompt_file_selection(workspace_path: Path) -> Path | None:
@@ -766,21 +984,26 @@ def _warn_overwrite(project_path: Path, checkpoints: list[int]) -> None:
         for f in finals:
             console.print(f"  [yellow]•[/yellow] {f.name}")
         console.print(
-            "[dim]Iniciar uma nova pesquisa gerará um novo preview (o arquivo final não será alterado agora).[/dim]"
+            "[dim]Iniciar uma nova pesquisa sobrescreverá o preview existente "
+            "(o arquivo [final] não será alterado).[/dim]"
         )
-        if not typer.confirm("\nDeseja continuar mesmo assim?", default=False):
+        if not typer.confirm("\nDeseja continuar mesmo assim?", default=True):
             console.print("[dim]Operação cancelada.[/dim]")
             raise typer.Exit(0)
+        for n in checkpoints:
+            pw.reset_previews(n)
     elif previews:
         console.print("\n[bold yellow]⚠ Já existem previews neste workspace:[/bold yellow]")
         for f in previews:
             console.print(f"  [yellow]•[/yellow] {f.name}")
         console.print(
-            "[dim]Iniciar uma nova pesquisa gerará um novo preview numerado (os anteriores não serão apagados).[/dim]"
+            "[dim]Iniciar uma nova pesquisa sobrescreverá os previews existentes.[/dim]"
         )
-        if not typer.confirm("\nDeseja continuar mesmo assim?", default=False):
+        if not typer.confirm("\nDeseja continuar mesmo assim?", default=True):
             console.print("[dim]Operação cancelada.[/dim]")
             raise typer.Exit(0)
+        for n in checkpoints:
+            pw.reset_previews(n)
 
 
 def _read_docx_text(path: Path) -> str:
@@ -822,7 +1045,7 @@ def _finalize_checkpoint(state_path: Path, number: int) -> None:
             f"\n[bold yellow]⚠ Já existe um arquivo final:[/bold yellow]\n"
             f"  {final_path.name}"
         )
-        if not typer.confirm("Deseja sobrescrever?", default=False):
+        if not typer.confirm("Deseja sobrescrever?", default=True):
             console.print("[dim]Arquivo final mantido sem alteração.[/dim]")
             return
 
@@ -1125,7 +1348,7 @@ _NODE_LABELS: dict[str, str] = {
 }
 
 
-def _print_node_progress(node_name: str, output: object) -> None:
+def _print_node_progress(node_name: str, output: object, prev_findings_count: int = 0) -> None:
     """Print a user-friendly progress line for a completed node.
 
     Shows the friendly label, attempt number (for retry nodes), and
@@ -1134,6 +1357,8 @@ def _print_node_progress(node_name: str, output: object) -> None:
     Args:
         node_name: The LangGraph node name.
         output: The node's partial state output dict.
+        prev_findings_count: Number of findings in state before this node ran,
+            used to compute the delta for the execute node display.
     """
     label = _NODE_LABELS.get(node_name, node_name)
     extra = ""
@@ -1146,8 +1371,9 @@ def _print_node_progress(node_name: str, output: object) -> None:
         if attempt is not None and node_name == "plan":
             extra = f" [dim](tentativa {attempt + 1})[/dim]"
         elif node_name == "execute" and findings is not None:
-            n = len(findings)
-            extra = f" [dim]({n} resultado{'s' if n != 1 else ''} acumulado{'s' if n != 1 else ''})[/dim]"
+            new_n = len(findings) - prev_findings_count
+            total_n = len(findings)
+            extra = f" [dim](+{new_n} novos · {total_n} no total)[/dim]"
         elif node_name == "evaluate" and evaluation:
             score = evaluation.get("total_score", 0.0)
             converged = evaluation.get("converged", False)
@@ -1164,6 +1390,90 @@ def _print_node_progress(node_name: str, output: object) -> None:
     console.print(f"  [green]✓[/green] {label}{extra}")
 
 
+def _handle_support_request(state: dict, workspace: Path) -> None:  # type: ignore[type-arg]
+    """Interactively collect researcher guidance after convergence failure.
+
+    Prints a diagnostic summary (quality score, sources consulted, per-metric
+    breakdown, gaps and an agent opinion), then opens a terminal input so the
+    researcher can supply revised instructions.  The guidance is saved to
+    ``state["user_guidance"]`` and persisted to disk.  The attempt counter is
+    also reset so the next run starts fresh.
+
+    Args:
+        state: Accumulated research state at the support interrupt point.
+        workspace: Path to the ResearchWorkspace (.state/) directory.
+    """
+    from ai_skill.core.workspace import ResearchWorkspace
+
+    evaluation: dict = state.get("evaluation") or {}
+    score: float = evaluation.get("total_score", 0.0)
+    per_metric: list = evaluation.get("per_metric", [])
+    gaps: list = evaluation.get("gaps", [])
+    attempt: int = int(state.get("attempt", 0))
+    findings: list = state.get("findings") or []
+
+    # Count unique source URLs across all skill outputs
+    all_sources: set = set()
+    for f in findings:
+        for src in (f.get("sources") or []):
+            all_sources.add(src)
+    source_count = len(all_sources)
+
+    # Build agent opinion based on score and metric breakdown
+    if score < 0.4:
+        opinion = "O agente não conseguiu encontrar fontes suficientes ou relevantes para o tema."
+    elif score < 0.6:
+        opinion = "As buscas retornaram resultados parciais, mas falta cobertura e profundidade temática."
+    else:
+        opinion = "O agente está próximo da convergência, mas critérios específicos não foram atingidos."
+
+    if per_metric:
+        worst = min(per_metric, key=lambda m: m.get("score", 1.0))
+        opinion += (
+            f" O critério mais deficiente foi: \"{worst.get('metric', '?')}\""
+            f" ({worst.get('score', 0.0):.0%})."
+        )
+        if worst.get("gaps"):
+            opinion += f" Lacuna específica: {worst['gaps'][0]}"
+
+    console.print("\n[bold red]━━ ORIENTAÇÃO ADICIONAL NECESSÁRIA ━━[/bold red]")
+    console.print(
+        f"\n[bold]Diagnóstico — após {attempt} tentativas sem convergência:[/bold]"
+    )
+    console.print(f"  [cyan]Score de qualidade atual:[/cyan]  {score:.2f} / 1.00")
+    console.print(f"  [cyan]Fontes únicas consultadas:[/cyan] {source_count}")
+
+    if per_metric:
+        console.print("\n[bold]Avaliação por critério:[/bold]")
+        for m in per_metric:
+            s = m.get("score", 0.0)
+            name = m.get("metric", "?")
+            color = "green" if s >= 0.75 else "yellow" if s >= 0.5 else "red"
+            console.print(f"  [{color}]{s:.0%}[/{color}]  {name}")
+
+    if gaps:
+        console.print("\n[bold]Lacunas identificadas:[/bold]")
+        for g in gaps:
+            console.print(f"  [yellow]•[/yellow] {g}")
+
+    console.print(f"\n[bold]Avaliação do agente:[/bold] {opinion}")
+    console.print(
+        "\n[dim]Forneça orientação para o agente replanejar as buscas.\n"
+        "Exemplos: sugerir termos, restringir período, indicar fontes específicas.[/dim]"
+    )
+
+    guidance = typer.prompt("\nOrientação adicional").strip()
+
+    state["user_guidance"] = guidance if guidance else None
+    state["attempt"] = 0  # reset so the next run doesn't immediately re-trigger support
+
+    from ai_skill.core.workspace import ResearchWorkspace  # noqa: F811
+    ResearchWorkspace(workspace).save_state(state)
+
+    console.print("\n[green]Orientação registrada.[/green] Retome a pesquisa com:")
+    console.print(f"  ai-skill begin-literature --workspace \"{workspace.parent}\"")
+
+
 def _handle_checkpoint(
     _interrupt_data: object,
     state: dict,  # type: ignore[type-arg]
@@ -1172,15 +1482,25 @@ def _handle_checkpoint(
     """Dispatch to the correct checkpoint handler.
 
     Dispatch logic:
-    - active_checkpoint == 2              → CP2 review prompt
-    - active_checkpoint == 1, approved   → CP2 start prompt (begin_literature gate)
-    - active_checkpoint == 1, not yet    → CP1 review prompt
+    - convergence failed (attempt >= max_retries) → support request prompt
+    - active_checkpoint == 2                       → CP2 review prompt
+    - active_checkpoint == 1, approved             → CP2 start prompt
+    - active_checkpoint == 1, not yet              → CP1 review prompt
 
     Args:
         _interrupt_data: Data from the ``__interrupt__`` event (unused).
         state: Accumulated research state at the point of interruption.
         workspace: Path to the ResearchWorkspace (.state/) directory.
     """
+    import os as _os
+    max_retries = int(_os.environ.get("AI_SKILL_MAX_RETRIES", "5"))
+    attempt = int(state.get("attempt", 0))
+    evaluation: dict = state.get("evaluation") or {}
+
+    if attempt >= max_retries and not evaluation.get("converged"):
+        _handle_support_request(state, workspace)
+        return
+
     active_cp = int(state.get("active_checkpoint", 1))
     if active_cp == 2:
         _handle_checkpoint_2(state, workspace)

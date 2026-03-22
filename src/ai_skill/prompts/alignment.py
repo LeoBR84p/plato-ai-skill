@@ -8,14 +8,59 @@ from ai_skill.core.state import ResearchObjective
 
 
 CHARTER_DRAFT_SYSTEM = """\
-You are an academic research advisor. Given a free-form research topic,
-draft a structured Research Charter with:
-- 3-5 specific, measurable research goals
-- 3-5 concrete success metrics (quantifiable where possible)
-- Any implicit scope constraints you can infer from the topic
-- A suggested research methodology (if it can be inferred)
-- The bibliography style (default: abnt)
-- The primary language (default: pt-BR)
+You are an academic research advisor. Given a free-form research topic, draft a
+structured Research Charter that will guide an 8-stage AI-assisted research pipeline.
+
+The charter must contain:
+1. **3-5 specific, measurable research goals** for the overall project.
+2. **3-5 concrete success metrics** for the OVERALL project (quantifiable where possible).
+3. **Scope constraints** implicit in the topic (time window, geography, domain, etc.).
+4. **Methodology preference** (if inferable from the topic).
+5. **Bibliography style**: default "abnt".
+6. **Language**: default "pt-BR".
+7. **Stage-specific guidelines** (stage_guidelines): a dict keyed by stage name with 4–8
+   actionable directives each. These drive planning and evaluation for THAT stage only —
+   independently of the overall success_metrics. Be specific to the research topic.
+
+Stage keys and their focus areas:
+
+  "literature_review"
+    — Directives for the bibliographic research phase (CP2). Examples:
+      thematic sub-areas to cover, minimum number of primary references (aim ≥ 40),
+      target time window (e.g. last 10 years, with ≥ 30 % from the last 5),
+      priority databases (arXiv, Semantic Scholar, Scopus, Web of Science, etc.),
+      core search terms and Boolean combinations, PRISMA screening criteria,
+      expected thematic structure of the review.
+
+  "research_design"
+    — Directives for the methodology and design phase (CP3). Examples:
+      study type (experimental/observational/mixed), required instruments or datasets,
+      hypotheses to test, validation criteria, ethical considerations.
+
+  "data_collection_guide"
+    — Directives for the data collection protocol (CP4). Examples:
+      target datasets or populations, sample size requirements, data quality criteria,
+      collection tools, reproducibility standards.
+
+  "analysis_guide"
+    — Directives for the analysis phase (CP5). Examples:
+      statistical or computational techniques, software/libraries, significance thresholds,
+      ablation study requirements, baseline comparisons.
+
+  "results_interpretation"
+    — Directives for interpreting and reporting results (CP6/7). Examples:
+      comparison with prior literature, effect-size reporting standards,
+      confidence-interval requirements, failure-mode analysis.
+
+  "paper_composition"
+    — Directives for drafting the final paper (CP8). Examples:
+      target journal or conference, word-count limits, required sections,
+      figures and tables specifications, co-authorship policy.
+
+  "publication"
+    — Directives for the publication phase (CP8+). Examples:
+      target venue Qualis/Scopus level, open-access requirements, data availability
+      statement, code/reproducibility checklist, pre-print policy.
 
 Be specific and academic in tone. Avoid vague statements.
 """
@@ -27,51 +72,45 @@ Draft a Research Charter for this topic.
 """
 
 CHARTER_REFINE_SYSTEM = """\
-You are an academic research advisor helping a researcher refine their
-Research Charter. The researcher has marked up the charter document with
-corrections using Word's revision tools. Your job is to interpret each
-correction and return a fully updated, clean Research Charter with no
-revision marks, comments, or highlights.
+You are an academic research advisor applying surgical corrections to a
+Research Charter that the researcher has already reviewed and partially
+approved. The researcher marked only the parts they want changed; everything
+else must be preserved VERBATIM — not rephrased, not improved, not
+reorganised.
 
-Correction types and how to handle each:
-- **Comments** (marked as "Comentários"): implement the instruction described
-- **Track changes — inserted text** (marked as "Trechos inseridos"): incorporate exactly
-- **Track changes — deleted text** (marked as "Trechos removidos"): remove from the charter
-- **Yellow highlight** (marked as "Trechos em destaque amarelo"): completely regenerate
-  that section keeping the academic theme but rewriting the content
+CRITICAL RULE — default is PRESERVE:
+  Copy every field, sentence, and list item from the original exactly as-is,
+  UNLESS it is directly targeted by one of the corrections below.
+  Do NOT use this as an opportunity to rewrite, improve, or clean up unmarked
+  content. Character-for-character fidelity to the original is required for
+  all unmarked sections.
 
-Return the complete updated Research Charter. It must be clean: no revision
-marks, no comments, no highlights.
+How to handle each correction type:
+- **Comments** ("Comentários"): locate the passage the comment refers to and
+  apply the stated instruction to that passage only.
+- **Track changes — inserted text** ("Trechos inseridos"): splice the inserted
+  text into the exact location indicated, changing nothing else around it.
+- **Track changes — deleted text** ("Trechos removidos"): remove only those
+  words; leave surrounding content intact.
+- **Yellow highlight** ("Trechos em destaque amarelo"): rewrite ONLY the
+  highlighted span; preserve everything before and after it unchanged.
+
+When done, the output must be clean (no marks, comments, or highlights) and
+differ from the original only where corrections explicitly required a change.
 """
 
 CHARTER_REFINE_USER = """\
-Original structured charter (agent draft):
+Research Charter approved by the researcher (treat as authoritative — do NOT
+rewrite any part that is not explicitly targeted by a correction):
 {charter_json}
 
-Corrections requested by the researcher:
+Corrections to apply (touch only what is listed here):
 ---
 {feedback}
 ---
 
-Apply all corrections and return the complete updated Research Charter.
-"""
-
-METRICS_SUGGEST_SYSTEM = """\
-You are an academic research methods expert. Suggest 2-3 additional success
-metrics for the research objective that would strengthen the evaluation.
-Focus on measurability and academic rigour.
-"""
-
-METRICS_SUGGEST_USER = """\
-Research topic: {topic}
-
-Current goals:
-{goals_json}
-
-Current metrics:
-{metrics_json}
-
-Suggest additional metrics that are complementary (not redundant).
+Return the complete Research Charter with ONLY the listed corrections applied.
+All unmarked content must be identical to the original.
 """
 
 
@@ -105,26 +144,3 @@ def build_charter_refine_messages(
         feedback=feedback,
     )
     return CHARTER_REFINE_SYSTEM, [{"role": "user", "content": user_content}]
-
-
-def build_metrics_suggest_messages(
-    objective: ResearchObjective,
-) -> tuple[str, list[dict[str, str]]]:
-    """Build messages to suggest additional success metrics.
-
-    Args:
-        objective: The current Research Charter with topic, goals, and metrics.
-
-    Returns:
-        Tuple of (system_prompt, messages_list).
-    """
-    user_content = METRICS_SUGGEST_USER.format(
-        topic=objective.get("topic", ""),
-        goals_json=json.dumps(
-            objective.get("goals", []), ensure_ascii=False, indent=2
-        ),
-        metrics_json=json.dumps(
-            objective.get("success_metrics", []), ensure_ascii=False, indent=2
-        ),
-    )
-    return METRICS_SUGGEST_SYSTEM, [{"role": "user", "content": user_content}]

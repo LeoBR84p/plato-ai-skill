@@ -412,6 +412,30 @@ class ProjectWorkspace:
         })
         return target
 
+    def reset_previews(self, number: int) -> int:
+        """Delete all preview files for a checkpoint so the next save starts at preview_1.
+
+        Called when the user confirms to overwrite an existing run (e.g. re-running
+        begin-research on a workspace that already has previews).  The [final].docx
+        is intentionally left untouched.
+
+        Args:
+            number: Checkpoint number (1–8).
+
+        Returns:
+            Number of files deleted.
+        """
+        if not self.path.exists():
+            return 0
+        stage_name = CHECKPOINT_NAMES.get(number, f"Stage {number}")
+        prefix = f"Checkpoint {number} - {stage_name} [preview_"
+        deleted = 0
+        for f in list(self.path.iterdir()):
+            if f.is_file() and f.name.startswith(prefix) and f.name.endswith("].docx"):
+                f.unlink()
+                deleted += 1
+        return deleted
+
     def get_last_preview(self, number: int) -> Path | None:
         """Return the most recent preview file for a checkpoint, or None.
 

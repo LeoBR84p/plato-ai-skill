@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ai_skill.core.llm_client import LLMClient, LLMClientError
+from ai_skill.core import history as _history
+from ai_skill.core.llm_client import LLMClient, LLMClientError, set_current_node
 from ai_skill.core.pipeline_stages import PipelineStage, ResearchStatus
 from ai_skill.core.project_workspace import ProjectWorkspace
 from ai_skill.core.state import (
@@ -78,14 +80,15 @@ class _ExecutionPlanLLM(BaseModel):
 
 
 class _EvaluationResultLLM(BaseModel):
-    """LLM-parseable representation of an EvaluationResult."""
+    """LLM-parseable representation of an EvaluationResult.
+
+    Note: total_score and converged are NOT in this model — they are computed
+    deterministically in Python from per_metric scores to eliminate LLM arithmetic
+    errors and premature convergence declarations.
+    """
 
     per_metric: list[dict[str, Any]] = Field(
         description="List of {metric, score, rationale, gaps} dicts."
-    )
-    total_score: float = Field(description="Weighted average score 0.0-1.0.", ge=0.0, le=1.0)
-    converged: bool = Field(
-        description=f"True when total_score >= {_CONVERGENCE_THRESHOLD}."
     )
     gaps: list[str] = Field(description="Aggregated gaps across all metrics.")
 
@@ -100,6 +103,16 @@ class _CharterLLM(BaseModel):
     methodology_preference: str = Field(default="")
     bibliography_style: str = Field(default="abnt")
     language: str = Field(default="pt-BR")
+    stage_guidelines: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Stage-specific directives keyed by PipelineStage value "
+            "(literature_review, research_design, data_collection_guide, "
+            "analysis_guide, results_interpretation, paper_composition, publication). "
+            "Each entry is a list of 4-8 actionable items driving planning and "
+            "evaluation for that stage independently of the overall success_metrics."
+        ),
+    )
 
 
 class _LiteratureSourceLLM(BaseModel):
@@ -199,6 +212,7 @@ def align_charter(state: ResearchState, llm: LLMClient | None = None) -> dict[st
         Partial state update with the updated ``objective`` and cleared
         ``user_feedback`` (consumed by this node).
     """
+    _configure_history(state, "align_charter")
     _llm = llm or LLMClient()
     user_feedback = state.get("user_feedback")
     existing_objective = state.get("objective")
@@ -231,6 +245,10 @@ def align_charter(state: ResearchState, llm: LLMClient | None = None) -> dict[st
         logger.error("Charter generation failed: %s", exc)
         return {"status": ResearchStatus.FAILED}
 
+    # Preserve generated_at from the first draft; never update it on refinement
+    existing_generated_at = (existing_objective or {}).get("generated_at", "")
+    generated_at = existing_generated_at or _today_dd_mm_yyyy()
+
     objective = ResearchObjective(
         topic=charter_obj.topic,
         goals=charter_obj.goals,
@@ -239,6 +257,8 @@ def align_charter(state: ResearchState, llm: LLMClient | None = None) -> dict[st
         methodology_preference=charter_obj.methodology_preference,
         bibliography_style=charter_obj.bibliography_style,
         language=charter_obj.language,
+        generated_at=generated_at,
+        stage_guidelines=charter_obj.stage_guidelines,
     )
 
     workspace_path = state.get("workspace_path", "")
@@ -325,31 +345,6 @@ def route_cp2_start(state: ResearchState) -> str:
     return "plan"
 
 
-def begin_literature(state: ResearchState) -> dict[str, Any]:
-    """Transition gate that pauses the pipeline between CP1 and the research phase.
-
-    The graph pauses (``interrupt_before``) before this node so the user must
-    explicitly issue ``ai-skill resume`` to start the literature research phase.
-    On resume, this node simply advances the stage and hands off to ``plan``.
-
-    Args:
-        state: Current ResearchState.
-
-    Returns:
-        Partial state update advancing to the LITERATURE_REVIEW stage.
-    """
-    workspace_path = state.get("workspace_path", "")
-    if workspace_path:
-        ResearchWorkspace(Path(workspace_path)).log(
-            "Stage 2 — Literatura: iniciando fase de pesquisa bibliográfica."
-        )
-    return {
-        "stage": PipelineStage.LITERATURE_REVIEW,
-        "status": ResearchStatus.PLANNING,
-        "attempt": 0,
-    }
-
-
 def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMClient | None = None) -> dict[str, Any]:
     """Generate an ExecutionPlan using the LLM.
 
@@ -361,6 +356,7 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
     Returns:
         Partial state update with the new plan.
     """
+    _configure_history(state, "plan")
     _registry = registry or _get_default_registry()
     _llm = llm or LLMClient()
 
@@ -368,16 +364,32 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
         topic="", goals=[], success_metrics=[]
     )
     stage = state.get("stage", PipelineStage.LITERATURE_REVIEW)
+    stage_str = str(stage.value if hasattr(stage, "value") else stage)
     attempt = state.get("attempt", 0)
     previous_eval = state.get("evaluation")
     gaps = previous_eval.get("gaps", []) if previous_eval else []
+    user_guidance = state.get("user_guidance")
+
+    # Use stage-specific guidelines. For LITERATURE_REVIEW, fall back to
+    # bibliographic-only defaults rather than the overall success_metrics,
+    # so the planner never confuses CP2 scope with full project criteria.
+    raw_guidelines = (objective.get("stage_guidelines") or {}).get(stage_str)
+    if raw_guidelines:
+        stage_guidelines: list[str] | None = raw_guidelines
+    elif stage_str == PipelineStage.LITERATURE_REVIEW.value:
+        stage_guidelines = _default_literature_review_guidelines()
+    else:
+        defaults = _default_stage_guidelines(stage_str)
+        stage_guidelines = defaults if defaults else None
 
     system, messages = build_planning_messages(
         objective=objective,
-        stage=str(stage.value if hasattr(stage, "value") else stage),
+        stage=stage_str,
         attempt=attempt,
         gaps=gaps,
         skill_registry_summary=_registry.all_as_dicts(),
+        user_guidance=user_guidance,
+        stage_guidelines=stage_guidelines,
     )
 
     try:
@@ -410,6 +422,7 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
     return {
         "plan": execution_plan,
         "status": ResearchStatus.EXECUTING,
+        "user_guidance": None,  # consumed; clear so it doesn't repeat on next attempt
     }
 
 
@@ -433,7 +446,7 @@ def execute(
     current_plan = state.get("plan")
     if not current_plan or not current_plan.get("steps"):
         logger.warning("execute: no plan or empty steps — skipping.")
-        return {"findings": state.get("findings", [])}
+        return {"findings": state.get("findings", []), "findings_current": []}
 
     objective = state.get("objective")
     stage = state.get("stage", PipelineStage.LITERATURE_REVIEW)
@@ -462,12 +475,37 @@ def execute(
         )
         outputs.update(batch_outputs)
 
-    findings: list[SkillOutput] = list(outputs.values())
+        # Log each skill execution to llm_history.yaml
+        _history.configure(state.get("workspace_path", ""))
+        stage_str_exec = str(stage.value if hasattr(stage, "value") else stage)
+        for step in batch:
+            sid = step["step_id"]
+            out = batch_outputs.get(sid)
+            if out is not None:
+                _history.log_skill_call(
+                    skill=step.get("skill_name", "unknown"),
+                    stage=stage_str_exec,
+                    attempt=attempt,
+                    request_sent={
+                        k: v for k, v in step.get("parameters", {}).items()
+                        if k not in ("content",)  # omit large text blobs
+                    },
+                    response_received={
+                        "confidence": out.get("confidence", 0.0),
+                        "sources_count": len(out.get("sources", [])),
+                        "sources": out.get("sources", [])[:20],
+                        "error": out.get("error"),
+                        "result_keys": list(out.get("result", {}).keys()),
+                    },
+                )
+
+    findings_current: list[SkillOutput] = list(outputs.values())
     existing_findings = state.get("findings", [])
-    all_findings = existing_findings + findings
+    all_findings = existing_findings + findings_current
 
     return {
         "findings": all_findings,
+        "findings_current": findings_current,
         "status": ResearchStatus.EVALUATING,
     }
 
@@ -485,18 +523,36 @@ def evaluate(
     Returns:
         Partial state update with evaluation result and incremented attempt counter.
     """
+    _configure_history(state, "evaluate")
     _llm = llm or LLMClient()
     objective = state.get("objective") or ResearchObjective(
         topic="", goals=[], success_metrics=[]
     )
-    findings = state.get("findings", [])
+    # Use only the current attempt's findings for evaluation so that poor results
+    # from earlier retries do not contaminate scoring of the current attempt.
+    findings = state.get("findings_current") or state.get("findings", [])
     attempt = state.get("attempt", 0)
     quality_history = state.get("quality_history", [])
+    stage = state.get("stage", PipelineStage.LITERATURE_REVIEW)
+    stage_str = str(stage.value if hasattr(stage, "value") else stage)
+
+    # Use stage-specific guidelines. For LITERATURE_REVIEW, fall back to
+    # bibliographic-only defaults so evaluation never mixes CP2 scope with
+    # full project criteria (implementation, publication, etc.).
+    raw_guidelines = (objective.get("stage_guidelines") or {}).get(stage_str)
+    if raw_guidelines:
+        stage_guidelines: list[str] | None = raw_guidelines
+    elif stage_str == PipelineStage.LITERATURE_REVIEW.value:
+        stage_guidelines = _default_literature_review_guidelines()
+    else:
+        defaults = _default_stage_guidelines(stage_str)
+        stage_guidelines = defaults if defaults else None
 
     system, messages = build_evaluation_messages(
         objective=objective,
         findings=findings,
         threshold=_CONVERGENCE_THRESHOLD,
+        stage_guidelines=stage_guidelines,
     )
 
     try:
@@ -510,18 +566,11 @@ def evaluate(
         # Fail-safe: treat as not converged with empty gaps
         eval_obj = _EvaluationResultLLM(
             per_metric=[],
-            total_score=0.0,
-            converged=False,
             gaps=[f"Evaluation error: {exc}"],
         )
 
-    # Detect regression vs previous attempt
-    previous_score = quality_history[-1]["total_score"] if quality_history else None
-    regression = (
-        previous_score is not None
-        and (previous_score - eval_obj.total_score) > 0.05
-    )
-
+    # Compute total_score and converged deterministically in Python.
+    # Never trust the LLM to do arithmetic — it introduces non-determinism.
     per_metric: list[MetricScore] = [
         MetricScore(
             metric=m.get("metric", ""),
@@ -531,34 +580,51 @@ def evaluate(
         )
         for m in eval_obj.per_metric
     ]
+    scores = [m["score"] for m in per_metric]
+    total_score = sum(scores) / len(scores) if scores else 0.0
+    converged = total_score >= _CONVERGENCE_THRESHOLD
+
+    # Detect regression vs previous attempt
+    previous_score = quality_history[-1]["total_score"] if quality_history else None
+    regression = (
+        previous_score is not None
+        and (previous_score - total_score) > 0.05
+    )
 
     evaluation = EvaluationResult(
         per_metric=per_metric,
-        total_score=eval_obj.total_score,
-        converged=eval_obj.converged,
+        total_score=total_score,
+        converged=converged,
         gaps=eval_obj.gaps,
         regression=regression,
     )
 
     # Build quality snapshot
-    stage = state.get("stage", PipelineStage.LITERATURE_REVIEW)
     skills_used = list({
         f.get("skill_name", "") for f in findings if f.get("skill_name")
     })
     snapshot = QualitySnapshot(
         attempt=attempt,
-        stage=str(stage.value if hasattr(stage, "value") else stage),
-        total_score=eval_obj.total_score,
+        stage=stage_str,
+        total_score=total_score,
         per_metric_scores={m["metric"]: float(m["score"]) for m in eval_obj.per_metric},
         skills_used=skills_used,
         cache_hit_rate=0.0,  # ResearchMemory added in Phase 2
     )
 
+    # Update both the continuous history and the per-stage isolated history
+    stage_quality_history: dict[str, list[QualitySnapshot]] = dict(
+        state.get("stage_quality_history") or {}
+    )
+    stage_history_for_stage = list(stage_quality_history.get(stage_str, []))
+    stage_history_for_stage.append(snapshot)
+    stage_quality_history[stage_str] = stage_history_for_stage
+
     if regression:
         logger.warning(
             "Quality regression detected: %.2f → %.2f (attempt %d)",
             previous_score,
-            eval_obj.total_score,
+            total_score,
             attempt,
         )
 
@@ -566,45 +632,9 @@ def evaluate(
         "evaluation": evaluation,
         "attempt": attempt + 1,
         "quality_history": quality_history + [snapshot],
-        "status": ResearchStatus.CONVERGED if eval_obj.converged else ResearchStatus.EXECUTING,
+        "stage_quality_history": stage_quality_history,
+        "status": ResearchStatus.CONVERGED if converged else ResearchStatus.EXECUTING,
     }
-
-
-def deliver(state: ResearchState) -> dict[str, Any]:
-    """Write findings.md to the workspace and mark the project as completed.
-
-    Args:
-        state: Current ResearchState with findings and quality history.
-
-    Returns:
-        Partial state update with status=COMPLETED.
-    """
-    workspace_path = state.get("workspace_path", "")
-    objective = state.get("objective") or {}
-    findings = state.get("findings", [])
-    quality_history = state.get("quality_history", [])
-    evaluation = state.get("evaluation") or {}
-
-    if workspace_path:
-        workspace = ResearchWorkspace(Path(workspace_path))
-        content = _format_findings_md(objective, findings, quality_history, evaluation)
-        workspace.write_findings(content)
-        workspace.log(
-            f"Pipeline converged. Final score: {evaluation.get('total_score', 0):.2f}"
-        )
-        project_ws = _get_project_workspace(workspace_path)
-        if project_ws is not None:
-            docx_bytes = _findings_to_docx(content, title="Literature Review")
-            if docx_bytes:
-                saved = project_ws.save_checkpoint_preview(2, docx_bytes)
-                logger.info("Checkpoint 2 saved: %s", saved)
-
-    logger.info(
-        "Research pipeline completed. Score: %.2f",
-        evaluation.get("total_score", 0.0),
-    )
-
-    return {"status": ResearchStatus.COMPLETED}
 
 
 def request_support(state: ResearchState) -> dict[str, Any]:
@@ -640,7 +670,7 @@ def request_support(state: ResearchState) -> dict[str, Any]:
         )
 
     return {
-        "status": ResearchStatus.FAILED,
+        "status": ResearchStatus.CHECKPOINT_PENDING,
         "checkpoint_pending": True,
         "checkpoint_label": (
             f"SUPPORT NEEDED: {message}"
@@ -671,18 +701,50 @@ def compile_literature(
         Partial state update with ``literature_review_doc`` and
         ``active_checkpoint=2``.
     """
+    _configure_history(state, "compile_literature")
     _llm = llm or LLMClient()
     findings = state.get("findings", [])
     charter_document_text = state.get("charter_document_text", "")
 
+    # Sort by confidence (desc) and take top 40 to prevent token overflow.
+    # Uses all accumulated findings (not just current attempt) for richer compilation.
+    sorted_findings = sorted(findings, key=lambda f: f.get("confidence", 0.0), reverse=True)
+    top_findings = sorted_findings[:40]
+
     findings_summary: list[dict[str, Any]] = []
-    for f in findings:
-        findings_summary.append({
-            "skill": f.get("skill_name", ""),
-            "sources": f.get("sources", []),
-            "result": f.get("result", {}),
+    for f in top_findings:
+        skill_name = f.get("skill_name", "")
+        result = f.get("result") or {}
+        entry: dict[str, Any] = {
+            "skill": skill_name,
             "confidence": f.get("confidence", 0.0),
-        })
+            "sources": f.get("sources", [])[:5],
+        }
+        if skill_name == "article_search":
+            papers = result.get("papers", [])
+            entry["papers"] = [
+                {
+                    "title": p.get("title", ""),
+                    "abstract": (p.get("abstract", "") or "")[:300],
+                    "url": p.get("url", ""),
+                    "year": p.get("year"),
+                    "authors": p.get("authors", [])[:3],
+                    "venue": p.get("venue", ""),
+                }
+                for p in papers[:15]
+            ]
+        elif skill_name == "content_summarizer":
+            entry["summary"] = (result.get("summary", "") or "")[:500]
+            entry["key_points"] = result.get("key_points", [])[:5]
+        else:
+            for k, v in list(result.items())[:5]:
+                if isinstance(v, str):
+                    entry[k] = v[:400]
+                elif isinstance(v, list):
+                    entry[k] = v[:10]
+                else:
+                    entry[k] = v
+        findings_summary.append(entry)
 
     system, messages = build_compile_messages(
         charter_document_text=charter_document_text,
@@ -759,6 +821,7 @@ def verify_literature(
     Returns:
         Partial state update with verified ``literature_review_doc``.
     """
+    _configure_history(state, "verify_literature")
     _llm = llm or LLMClient()
     review_doc: dict[str, Any] = dict(state.get("literature_review_doc") or {})
     references: list[dict[str, Any]] = list(review_doc.get("references", []))
@@ -768,9 +831,14 @@ def verify_literature(
         return {"literature_review_doc": LiteratureReviewDoc(**review_doc)}
 
     access_date = _abnt_access_date()
-    verified: list[SourceVerification] = []
 
+    # Replace ACCESS_DATE placeholder in all references upfront
     for ref in references:
+        abnt_entry = ref.get("abnt_entry", "")
+        ref["abnt_entry"] = abnt_entry.replace("{ACCESS_DATE}", access_date)
+
+    def _verify_one(ref: dict[str, Any]) -> SourceVerification:
+        """Verify a single reference — runs in a thread pool worker."""
         url = ref.get("url", "")
         ref_num = ref.get("reference_number", 0)
         title = ref.get("title", "")
@@ -790,24 +858,21 @@ def verify_literature(
                 fetched_content=fetched_content,
             )
             try:
-                result: _VerifyResultLLM = _llm.complete_structured(
+                v_result: _VerifyResultLLM = _llm.complete_structured(
                     messages=messages,
                     response_model=_VerifyResultLLM,
                     system=system,
                     temperature=0.0,
                 )
-                content_matches = result.content_matches
-                note = result.verification_note
+                content_matches = v_result.content_matches
+                note = v_result.verification_note
             except LLMClientError as exc:
                 logger.warning(
                     "Verification LLM call failed for ref [%d]: %s", ref_num, exc
                 )
                 note = f"Verificação automática falhou: {exc}"
 
-        abnt_entry = ref.get("abnt_entry", "")
-        ref["abnt_entry"] = abnt_entry.replace("{ACCESS_DATE}", access_date)
-
-        verified.append(SourceVerification(
+        return SourceVerification(
             reference_number=ref_num,
             url=url,
             title=title,
@@ -815,7 +880,18 @@ def verify_literature(
             content_matches=content_matches,
             verification_note=note,
             access_date=access_date,
-        ))
+        )
+
+    verified: list[SourceVerification] = []
+    max_workers = min(5, max(1, len(references)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_verify_one, ref): ref for ref in references}
+        for future in as_completed(futures):
+            try:
+                verified.append(future.result())
+            except Exception as exc:
+                ref = futures[future]
+                logger.warning("Verification failed for ref [%s]: %s", ref.get("url", "?"), exc)
 
     review_doc["references"] = references
     review_doc["verified_sources"] = verified  # type: ignore[assignment]
@@ -903,6 +979,7 @@ def refine_literature(
         Partial state update with refined ``literature_review_doc`` and
         cleared ``user_feedback``.
     """
+    _configure_history(state, "refine_literature")
     _llm = llm or LLMClient()
     review_doc: dict[str, Any] = state.get("literature_review_doc") or {}
     user_feedback = state.get("user_feedback", "")
@@ -1068,57 +1145,143 @@ def _charter_to_docx(objective: ResearchObjective) -> bytes:
         doc.add_heading("Preferência Metodológica", level=2)
         doc.add_paragraph(methodology)
 
+    # Render stage-specific guidelines — one section per CP stage
+    _STAGE_DISPLAY_NAMES: dict[str, str] = {
+        "literature_review":      "CP2 — Diretrizes da Revisão Bibliográfica",
+        "research_design":        "CP3 — Diretrizes do Design de Pesquisa",
+        "data_collection_guide":  "CP4 — Diretrizes da Coleta de Dados",
+        "analysis_guide":         "CP5 — Diretrizes da Análise",
+        "results_interpretation": "CP6/7 — Diretrizes de Interpretação de Resultados",
+        "paper_composition":      "CP8 — Diretrizes para Redação do Artigo",
+        "publication":            "CP8+ — Diretrizes para Publicação",
+    }
+    stage_guidelines: dict[str, list[str]] = objective.get("stage_guidelines") or {}
+    for stage_key, display_name in _STAGE_DISPLAY_NAMES.items():
+        directives = stage_guidelines.get(stage_key, [])
+        if directives:
+            doc.add_heading(display_name, level=2)
+            for directive in directives:
+                doc.add_paragraph(directive, style="List Bullet")
+
     bib_style = objective.get("bibliography_style", "abnt")
     language = objective.get("language", "pt-BR")
+    generated_at = objective.get("generated_at", "")
     meta_para = doc.add_paragraph()
-    meta_para.add_run(f"Estilo bibliográfico: {bib_style}  |  Idioma: {language}").font.size = Pt(9)
+    meta_line = f"Estilo bibliográfico: {bib_style}  |  Idioma: {language}"
+    if generated_at:
+        meta_line += f"  |  Gerado em: {generated_at}"
+    meta_para.add_run(meta_line).font.size = Pt(9)
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-def _findings_to_docx(findings_md: str, title: str = "Literature Review") -> bytes:
-    """Convert a Markdown findings report to a minimal .docx file.
 
-    Handles headings (``#``, ``##``, ``###``), bullet lists (``-``), and
-    plain paragraphs.  Suitable for Phase 1 checkpoint output.
+
+def _configure_history(state: ResearchState, node_name: str) -> None:
+    """Point the history logger at the current workspace and set node + stage names."""
+    workspace_path = state.get("workspace_path", "")
+    stage = state.get("stage")
+    stage_str = stage.value if hasattr(stage, "value") else str(stage or "")
+    if workspace_path:
+        _history.configure(workspace_path)
+    _history.set_current_stage(stage_str)
+    set_current_node(node_name)
+
+
+def _default_literature_review_guidelines() -> list[str]:
+    """Return generic bibliographic-only guidelines for CP2.
+
+    Used as fallback when the charter was created before stage_guidelines
+    were introduced, or when the researcher did not customise them.
+    These criteria are intentionally restricted to the bibliographic review
+    scope — they never reference implementation, experiments, or publication.
+    """
+    return [
+        "Realizar pelo menos 4 buscas distintas com queries diferentes cobrindo aspectos "
+        "teóricos, metodológicos e aplicados do tema de pesquisa.",
+        "Cada busca deve retornar resultados relevantes (total_found > 0); consultas em "
+        "arXiv e Semantic Scholar são obrigatórias.",
+        "O conjunto de buscas deve cobrir pelo menos 2 sub-áreas temáticas distintas "
+        "derivadas do tópico de pesquisa.",
+        "Ao menos 30% dos papers retornados devem ter sido publicados nos últimos 5 anos "
+        "(campo year >= ano_atual - 5).",
+        "Para ao menos 3 papers de alta relevância, executar summarização completa via "
+        "content_summarizer para extrair contribuições detalhadas ao campo.",
+        "As queries devem ser específicas o suficiente para retornar papers do domínio "
+        "correto — queries genéricas demais (total_found > 200) devem ser refinadas.",
+        "Cobrir tanto referências seminais (> 10 anos) quanto referências recentes "
+        "(< 3 anos) para mostrar evolução do campo.",
+        "Documentar os termos de busca e bases consultadas em cada step do plano.",
+    ]
+
+
+def _default_stage_guidelines(stage_str: str) -> list[str]:
+    """Return generic stage-specific guidelines for stages without custom directives.
+
+    Used as fallback when the charter was created without stage_guidelines for
+    a given stage. Criteria are scoped to each stage's specific deliverable and
+    never reference global project goals (implementation, publication, etc.).
 
     Args:
-        findings_md: Markdown text produced by :func:`_format_findings_md`.
-        title: Document title used as the top-level heading.
+        stage_str: PipelineStage value string (e.g. "research_design").
 
     Returns:
-        Raw bytes of the generated .docx file.
+        List of guideline strings, or empty list if stage_str is unrecognised.
     """
-    try:
-        import io
-        from docx import Document
-    except ImportError:
-        logger.warning("python-docx not available — skipping findings .docx export.")
-        return b""
+    defaults: dict[str, list[str]] = {
+        "research_design": [
+            "Identificar e justificar o método de pesquisa mais adequado ao objetivo.",
+            "Formular pelo menos 2 hipóteses ou questões de pesquisa testáveis.",
+            "Definir variáveis dependentes e independentes com precisão operacional.",
+            "Especificar os critérios de validade e confiabilidade da abordagem escolhida.",
+            "Relacionar a metodologia escolhida com precedentes na literatura revisada.",
+        ],
+        "data_collection_guide": [
+            "Produzir protocolo de coleta com instrumento, passos e critérios de aceitação.",
+            "Definir tamanho amostral mínimo com justificativa estatística.",
+            "Especificar formato de entrega dos dados (estrutura, unidades, codificação).",
+            "Incluir checklist de verificação pré-coleta para o pesquisador.",
+        ],
+        "analysis_guide": [
+            "Descrever passo a passo do método analítico com fórmulas em LaTeX.",
+            "Especificar softwares ou bibliotecas recomendados com versões.",
+            "Incluir critérios de interpretação dos resultados (ex: p-value, effect size).",
+            "Antecipar possíveis limitações ou fontes de erro na análise.",
+        ],
+        "results_interpretation": [
+            "Descrever resultados com base exclusivamente nos dados fornecidos pelo usuário.",
+            "Relacionar cada resultado com as hipóteses formuladas no design de pesquisa.",
+            "Identificar resultados inesperados e propor explicações plausíveis.",
+            "Discutir limitações dos resultados obtidos.",
+        ],
+        "paper_composition": [
+            "Produzir todas as seções: Abstract, Introdução, Metodologia, Resultados, "
+            "Discussão e Conclusão.",
+            "Garantir coerência narrativa entre seções e consistência das citações inline.",
+            "Aplicar formatação ABNT NBR 6023:2018 nas referências.",
+            "Revisar que cada afirmação factual está suportada por uma citação.",
+        ],
+        "publication": [
+            "Validar conformidade com TOP Guidelines (transparência, abertura).",
+            "Verificar FAIR principles para dados e materiais de pesquisa.",
+            "Exportar documento em .docx, Markdown e PDF.",
+            "Revisar metadados do documento (título, autores, palavras-chave, resumo).",
+        ],
+    }
+    return defaults.get(stage_str, [])
 
-    doc = Document()
-    doc.add_heading(title, level=1)
 
-    for line in findings_md.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("### "):
-            doc.add_heading(stripped[4:], level=3)
-        elif stripped.startswith("## "):
-            doc.add_heading(stripped[3:], level=2)
-        elif stripped.startswith("# "):
-            doc.add_heading(stripped[2:], level=1)
-        elif stripped.startswith("- "):
-            doc.add_paragraph(stripped[2:], style="List Bullet")
-        else:
-            doc.add_paragraph(stripped)
+def _today_dd_mm_yyyy() -> str:
+    """Return today's date in dd/mm/yyyy format for charter generation stamps.
 
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+    Returns:
+        String like "22/03/2026".
+    """
+    from datetime import datetime
+    now = datetime.now()
+    return f"{now.day:02d}/{now.month:02d}/{now.year}"
 
 
 def _abnt_access_date() -> str:
@@ -1368,67 +1531,3 @@ async def _run_batch_async(
     return dict(results)
 
 
-def _format_findings_md(
-    objective: dict[str, Any],
-    findings: list[SkillOutput],
-    quality_history: list[QualitySnapshot],
-    evaluation: dict[str, Any],
-) -> str:
-    """Format a findings.md document from the pipeline outputs.
-
-    Args:
-        objective: The research objective dict.
-        findings: List of skill outputs.
-        quality_history: List of quality snapshots.
-        evaluation: Final EvaluationResult dict.
-
-    Returns:
-        Markdown string for findings.md.
-    """
-    lines: list[str] = [
-        f"# Findings: {objective.get('topic', 'Research')}",
-        "",
-        "## Research Objective",
-        "",
-        f"**Topic**: {objective.get('topic', '')}",
-        "",
-        "**Goals**:",
-    ]
-    for goal in objective.get("goals", []):
-        lines.append(f"- {goal}")
-
-    lines += [
-        "",
-        "**Success Metrics**:",
-    ]
-    for metric in objective.get("success_metrics", []):
-        lines.append(f"- {metric}")
-
-    lines += [
-        "",
-        "## Quality Summary",
-        "",
-        f"**Final Score**: {evaluation.get('total_score', 0.0):.2f}",
-        f"**Converged**: {evaluation.get('converged', False)}",
-        f"**Attempts**: {len(quality_history)}",
-        "",
-    ]
-
-    if evaluation.get("per_metric"):
-        lines.append("**Per-metric scores**:")
-        for m in evaluation["per_metric"]:
-            lines.append(f"- {m.get('metric', '')}: {m.get('score', 0):.2f}")
-        lines.append("")
-
-    lines += [
-        "## Sources Consulted",
-        "",
-    ]
-    all_sources: list[str] = []
-    for finding in findings:
-        all_sources.extend(finding.get("sources", []))
-    unique_sources = list(dict.fromkeys(s for s in all_sources if s))
-    for src in unique_sources:
-        lines.append(f"- {src}")
-
-    return "\n".join(lines)

@@ -31,8 +31,14 @@ _SEMANTIC_SCHOLAR_FIELDS = "title,authors,abstract,year,externalIds,url,venue,ci
 _DEFAULT_MAX_RESULTS = 10
 
 # ---------------------------------------------------------------------------
-# Semantic Scholar rate limiter — 1 request / second across all endpoints
+# Per-API rate-limit locks (module-level = shared across ALL skill instances)
 # ---------------------------------------------------------------------------
+# arXiv: enforce sequential access so parallel skill steps never hit 429.
+# The arxiv.Client singleton already adds delay_seconds=3 between its own
+# requests; the lock ensures a second concurrent call queues behind the first.
+_arxiv_lock = threading.Lock()
+
+# Semantic Scholar: 1 request / second across all endpoints
 _ss_lock = threading.Lock()
 _ss_last_call: float = 0.0  # epoch timestamp of the most recent API call
 _SS_MIN_INTERVAL = 1.0  # seconds
@@ -149,6 +155,74 @@ class ArticleSearchSkill(BaseSkill):
                 f"All academic search sources failed: {'; '.join(errors)}"
             )
 
+        return self._build_output(query, all_papers, sources_queried, errors)
+
+    async def arun(self, input: SkillInput) -> SkillOutput:
+        """Run arXiv and Semantic Scholar searches in parallel.
+
+        arXiv calls are serialized globally via *_arxiv_lock* to prevent 429.
+        Semantic Scholar calls are serialized via *_ss_lock*.
+        Because the two locks are independent, both searches run concurrently
+        without idle time — parallel at the API level, serialized per service.
+        """
+        import asyncio
+
+        params = input.parameters
+        query: str | None = params.get("query")
+        if not query:
+            return self._error_output("Parameter 'query' is required.")
+
+        sources: list[str] = params.get("sources", ["arxiv", "semantic_scholar"])
+        max_results: int = int(params.get("max_results", _DEFAULT_MAX_RESULTS))
+        date_from: str | None = params.get("date_from")
+        seek_contradictions: bool = bool(params.get("seek_contradictions", False))
+
+        if seek_contradictions:
+            query = f"{query} limitations critique challenges"
+
+        loop = asyncio.get_event_loop()
+
+        # Build concurrent tasks — one per enabled source.
+        # Each runs in the default ThreadPoolExecutor so the per-API locks
+        # inside _search_arxiv / _search_semantic_scholar take effect.
+        source_tasks: list[tuple[str, Any]] = []
+        if "arxiv" in sources:
+            source_tasks.append(
+                ("arxiv", loop.run_in_executor(None, self._search_arxiv, query, max_results, date_from))
+            )
+        if "semantic_scholar" in sources:
+            source_tasks.append(
+                ("semantic_scholar", loop.run_in_executor(None, self._search_semantic_scholar, query, max_results))
+            )
+
+        all_papers: list[dict[str, Any]] = []
+        sources_queried: list[str] = []
+        errors: list[str] = []
+
+        results = await asyncio.gather(*(t for _, t in source_tasks), return_exceptions=True)
+        for (name, _), result in zip(source_tasks, results):
+            if isinstance(result, Exception):
+                errors.append(f"{name}: {result}")
+                logger.warning("%s search failed: %s", name, result)
+            else:
+                all_papers.extend(result)
+                sources_queried.append(name)
+
+        if not all_papers and errors:
+            return self._error_output(
+                f"All academic search sources failed: {'; '.join(errors)}"
+            )
+
+        return self._build_output(query, all_papers, sources_queried, errors)
+
+    def _build_output(
+        self,
+        query: str,
+        all_papers: list[dict[str, Any]],
+        sources_queried: list[str],
+        errors: list[str],
+    ) -> SkillOutput:
+        """Deduplicate, safety-filter and package papers into a SkillOutput."""
         # Deduplicate by DOI
         seen_dois: set[str] = set()
         unique_papers: list[dict[str, Any]] = []
@@ -168,9 +242,9 @@ class ArticleSearchSkill(BaseSkill):
             if not p.get("url") or p["url"] in safe_urls
         ]
 
-        error_msg: str | None = None
-        if errors:
-            error_msg = f"Partial results. Errors: {'; '.join(errors)}"
+        error_msg: str | None = (
+            f"Partial results. Errors: {'; '.join(errors)}" if errors else None
+        )
 
         return SkillOutput(
             skill_name="article_search",
@@ -209,7 +283,17 @@ class ArticleSearchSkill(BaseSkill):
                 "arxiv package is required. Install with: uv add arxiv"
             ) from exc
 
-        client = arxiv.Client()
+        # Shared client enforces arXiv's recommended 3 s delay between requests
+        # and retries automatically on transient failures (including 429).
+        # Using a module-level singleton ensures concurrent skill calls share
+        # the same rate-limit window instead of each creating a fresh client.
+        if not hasattr(self, "_arxiv_client"):
+            self._arxiv_client = arxiv.Client(
+                page_size=100,
+                delay_seconds=3.0,
+                num_retries=5,
+            )
+        client = self._arxiv_client
         search = arxiv.Search(
             query=query,
             max_results=max_results,

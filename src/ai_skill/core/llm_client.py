@@ -18,6 +18,23 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# Node name injected by nodes.py before each LLM call so history entries
+# carry human-readable context (e.g. "plan", "evaluate", "align_charter").
+_current_node: str = ""
+
+
+def set_current_node(name: str) -> None:
+    """Set the graph node name for history attribution.
+
+    Called by node functions in nodes.py immediately before using LLMClient.
+
+    Args:
+        name: Node function name (e.g. "plan", "evaluate", "align_charter").
+    """
+    global _current_node
+    _current_node = name
+
+
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_MAX_TOKENS = 8192
 _MAX_RETRIES = 3
@@ -119,9 +136,19 @@ class LLMClient:
 
                 response = self._raw_client.messages.create(**kwargs)
                 content = response.content[0]
-                if hasattr(content, "text"):
-                    return content.text
-                return str(content)
+                text = content.text if hasattr(content, "text") else str(content)
+                try:
+                    from ai_skill.core import history as _hist
+                    _hist.log_llm_call(
+                        system=system,
+                        messages=messages,
+                        response=text,
+                        model=self._model,
+                        node=_current_node,
+                    )
+                except Exception:
+                    pass
+                return text
 
             except anthropic.RateLimitError:
                 delay = _RETRY_BASE_DELAY * (2**attempt)
@@ -181,7 +208,20 @@ class LLMClient:
                 if temperature is not None:
                     kwargs["temperature"] = temperature
 
-                return self._instructor_client.messages.create(**kwargs)  # type: ignore[return-value]
+                result = self._instructor_client.messages.create(**kwargs)  # type: ignore[return-value]
+                try:
+                    import json as _json
+                    from ai_skill.core import history as _hist
+                    _hist.log_llm_call(
+                        system=system,
+                        messages=messages,
+                        response=_json.dumps(result.model_dump(), ensure_ascii=False),
+                        model=self._model,
+                        node=_current_node,
+                    )
+                except Exception:
+                    pass
+                return result
 
             except anthropic.RateLimitError:
                 delay = _RETRY_BASE_DELAY * (2**attempt)

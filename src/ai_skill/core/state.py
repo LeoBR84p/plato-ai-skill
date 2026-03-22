@@ -73,11 +73,16 @@ class ResearchObjective(TypedDict, total=False):
     Attributes:
         topic: Free-form description of the research topic.
         goals: List of specific research goals to achieve.
-        success_metrics: List of measurable criteria for success.
+        success_metrics: List of measurable criteria for the OVERALL project success.
         scope_constraints: Optional limitations on scope (time, geography, etc.).
         methodology_preference: Preferred research methodology if known.
         bibliography_style: Citation style (default: "abnt").
         language: Primary language of the paper (default: "pt-BR").
+        generated_at: Date of charter generation in dd/mm/yyyy format.
+        stage_guidelines: Stage-specific directives keyed by PipelineStage value
+            (e.g. "literature_review", "research_design", ...).  Each entry is a
+            list of 4-8 actionable items that drive planning and evaluation for
+            that stage, independently of the overall success_metrics.
     """
 
     topic: str
@@ -87,6 +92,8 @@ class ResearchObjective(TypedDict, total=False):
     methodology_preference: str
     bibliography_style: str
     language: str
+    generated_at: str
+    stage_guidelines: dict[str, list[str]]
 
 
 class PlanStep(TypedDict):
@@ -217,17 +224,19 @@ class ResearchState(TypedDict, total=False):
 
     # Planning and execution
     plan: ExecutionPlan
-    plan_candidates: list[ExecutionPlan]
-    findings: list[SkillOutput]
+    findings: list[SkillOutput]          # all outputs accumulated across ALL attempts
+    findings_current: list[SkillOutput]  # outputs of the CURRENT attempt only (used by evaluate)
 
     # Evaluation and quality
     evaluation: EvaluationResult
     attempt: int
-    quality_history: list[QualitySnapshot]
+    quality_history: list[QualitySnapshot]  # continuous across all stages
+    stage_quality_history: dict[str, list[QualitySnapshot]]  # per-stage isolation
 
     # Checkpoints and user interaction
     checkpoint_pending: bool
     user_feedback: str | None
+    user_guidance: str | None  # guidance provided interactively when convergence fails
     checkpoint_label: str
     charter_approved: bool
 
@@ -262,6 +271,8 @@ def initial_state(workspace_path: str, topic: str = "") -> ResearchState:
         scope_constraints=[],
         bibliography_style="abnt",
         language="pt-BR",
+        generated_at="",
+        stage_guidelines={},
     )
     return ResearchState(
         objective=objective,
@@ -274,9 +285,12 @@ def initial_state(workspace_path: str, topic: str = "") -> ResearchState:
         active_checkpoint=1,
         charter_document_text="",
         user_feedback=None,
+        user_guidance=None,
         document_version=0,
         workspace_path=str(workspace_path),
         findings=[],
+        findings_current=[],
         quality_history=[],
+        stage_quality_history={},
         messages=[],
     )
