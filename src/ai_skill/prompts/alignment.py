@@ -28,18 +28,32 @@ Draft a Research Charter for this topic.
 
 CHARTER_REFINE_SYSTEM = """\
 You are an academic research advisor helping a researcher refine their
-Research Charter. The researcher has provided feedback on the current draft.
-Incorporate their changes precisely and return the updated charter.
+Research Charter. The researcher has marked up the charter document with
+corrections using Word's revision tools. Your job is to interpret each
+correction and return a fully updated, clean Research Charter with no
+revision marks, comments, or highlights.
+
+Correction types and how to handle each:
+- **Comments** (marked as "Comentários"): implement the instruction described
+- **Track changes — inserted text** (marked as "Trechos inseridos"): incorporate exactly
+- **Track changes — deleted text** (marked as "Trechos removidos"): remove from the charter
+- **Yellow highlight** (marked as "Trechos em destaque amarelo"): completely regenerate
+  that section keeping the academic theme but rewriting the content
+
+Return the complete updated Research Charter. It must be clean: no revision
+marks, no comments, no highlights.
 """
 
 CHARTER_REFINE_USER = """\
-Current charter:
+Original structured charter (agent draft):
 {charter_json}
 
-Researcher feedback:
+Corrections requested by the researcher:
+---
 {feedback}
+---
 
-Return the complete updated Research Charter incorporating the feedback.
+Apply all corrections and return the complete updated Research Charter.
 """
 
 METRICS_SUGGEST_SYSTEM = """\

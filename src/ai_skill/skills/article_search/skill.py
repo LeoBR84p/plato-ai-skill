@@ -15,6 +15,8 @@ Parameters accepted in SkillInput.parameters:
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from typing import Any
 
 import httpx
@@ -27,6 +29,44 @@ logger = logging.getLogger(__name__)
 _SEMANTIC_SCHOLAR_ENDPOINT = "https://api.semanticscholar.org/graph/v1/paper/search"
 _SEMANTIC_SCHOLAR_FIELDS = "title,authors,abstract,year,externalIds,url,venue,citationCount"
 _DEFAULT_MAX_RESULTS = 10
+
+# ---------------------------------------------------------------------------
+# Semantic Scholar rate limiter — 1 request / second across all endpoints
+# ---------------------------------------------------------------------------
+_ss_lock = threading.Lock()
+_ss_last_call: float = 0.0  # epoch timestamp of the most recent API call
+_SS_MIN_INTERVAL = 1.0  # seconds
+
+
+def _ss_rate_limited_get(url: str, **kwargs: Any) -> httpx.Response:
+    """Perform an HTTP GET to a Semantic Scholar endpoint with 1 req/s throttling
+    and automatic retry on 429 (rate limit exceeded).
+
+    Args:
+        url: The full endpoint URL.
+        **kwargs: Passed directly to ``httpx.get``.
+
+    Returns:
+        The ``httpx.Response`` object.
+    """
+    global _ss_last_call  # noqa: PLW0603
+    max_retries = 4
+    for attempt in range(max_retries):
+        with _ss_lock:
+            elapsed = time.monotonic() - _ss_last_call
+            if elapsed < _SS_MIN_INTERVAL:
+                time.sleep(_SS_MIN_INTERVAL - elapsed)
+            _ss_last_call = time.monotonic()
+
+        response = httpx.get(url, **kwargs)
+        if response.status_code != 429:
+            return response
+
+        retry_after = int(response.headers.get("Retry-After", 5 * (2 ** attempt)))
+        logger.warning("Semantic Scholar 429 — aguardando %ds antes de tentar novamente.", retry_after)
+        time.sleep(retry_after)
+
+    return response  # return last response after exhausting retries
 
 
 class ArticleSearchSkill(BaseSkill):
@@ -222,7 +262,7 @@ class ArticleSearchSkill(BaseSkill):
         if api_key:
             headers["x-api-key"] = api_key
 
-        response = httpx.get(
+        response = _ss_rate_limited_get(
             _SEMANTIC_SCHOLAR_ENDPOINT,
             params={
                 "query": query,

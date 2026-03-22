@@ -11,6 +11,7 @@ dependencies = [
     { name = "anyio" },
     { name = "arxiv" },
     { name = "beautifulsoup4" },
+    { name = "ddgs" },
     { name = "duckduckgo-search" },
     { name = "exa-py" },
     { name = "firecrawl-py" },
@@ -63,6 +64,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.6.0" },
     { name = "arxiv", specifier = ">=2.1.0" },
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
+    { name = "ddgs", specifier = ">=9.11.4" },
     { name = "duckduckgo-search", specifier = ">=6.3.0" },
     { name = "exa-py", specifier = ">=1.0.0" },
     { name = "firecrawl-py", specifier = ">=1.0.0" },
@@ -630,6 +632,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e0/20/92eaa6b0aec7189fa4b75c890640e076e9e793095721db69c5c81142c2e1/cssselect2-0.9.0.tar.gz", hash = "sha256:759aa22c216326356f65e62e791d66160a0f9c91d1424e8d8adc5e74dddfc6fb", size = 35595, upload-time = "2026-02-12T17:16:39.614Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/21/0e/8459ca4413e1a21a06c97d134bfaf18adfd27cea068813dc0faae06cbf00/cssselect2-0.9.0-py3-none-any.whl", hash = "sha256:6a99e5f91f9a016a304dd929b0966ca464bcfda15177b6fb4a118fc0fb5d9563", size = 15453, upload-time = "2026-02-12T17:16:38.317Z" },
+]
+
+[[package]]
+name = "ddgs"
+version = "9.11.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "lxml" },
+    { name = "primp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d7/3c/0ea1d5685bb0cd3607556d76da30e64c158e5d86bb16a3555f232fe0a33f/ddgs-9.11.4.tar.gz", hash = "sha256:445e22d3ffa16f893bfb0a717593bb0f34d1ceb1df68b6ff4ec27b1a3cdf6941", size = 34798, upload-time = "2026-03-14T18:15:18.086Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/46/f9412fafdebd4eaba366b5336ee4987995ccc3db1bc450e865a34db5fb63/ddgs-9.11.4-py3-none-any.whl", hash = "sha256:62d4d05b25db5d225a727c0a2771ef40258c1d894582c73dad24c88bf90f918b", size = 43681, upload-time = "2026-03-14T18:15:17.063Z" },
 ]
 
 [[package]]

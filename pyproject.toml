@@ -28,6 +28,7 @@ dependencies = [
     "google-api-python-client>=2.150.0",
     "google-auth>=2.35.0",
     "google-auth-httplib2>=0.2.0",
+    "ddgs>=9.11.4",
 ]
 
 [project.optional-dependencies]

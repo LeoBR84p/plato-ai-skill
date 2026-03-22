@@ -169,8 +169,8 @@ class WebSearchSkill(BaseSkill):
         self,
         query: str,
         max_results: int,
-        language: str,
-        country: str,
+        _language: str,
+        _country: str,
         freshness: str,
     ) -> list[dict[str, str]]:
         """Query the Brave Web Search API.
@@ -185,15 +185,12 @@ class WebSearchSkill(BaseSkill):
         Returns:
             List of result dicts: [{title, url, snippet, source}].
         """
-        # Brave Search API supports up to 20 results per call
+        # Keep params minimal — Brave returns 422 for unrecognised/invalid values.
         count = min(max_results, 20)
         request_params: dict[str, Any] = {
             "q": query,
             "count": count,
-            "search_lang": language,
-            "country": country,
             "safesearch": "moderate",
-            "text_decorations": False,
         }
         if freshness:
             request_params["freshness"] = freshness
@@ -208,6 +205,10 @@ class WebSearchSkill(BaseSkill):
             },
             timeout=15.0,
         )
+        if not response.is_success:
+            logger.warning(
+                "Brave Search %d: %s", response.status_code, response.text[:300]
+            )
         response.raise_for_status()
         data: dict[str, Any] = response.json()
 
@@ -288,12 +289,14 @@ class WebSearchSkill(BaseSkill):
             List of result dicts: [{title, url, snippet, source}].
         """
         try:
-            from duckduckgo_search import DDGS
-        except ImportError as exc:
-            raise ImportError(
-                "duckduckgo-search is required for the DuckDuckGo fallback. "
-                "Install with: uv add duckduckgo-search"
-            ) from exc
+            from ddgs import DDGS  # package renamed from duckduckgo_search to ddgs
+        except ImportError:
+            try:
+                from duckduckgo_search import DDGS  # type: ignore[no-redef]
+            except ImportError as exc:
+                raise ImportError(
+                    "Install the ddgs package: uv add ddgs"
+                ) from exc
 
         results: list[dict[str, str]] = []
         with DDGS() as ddgs:

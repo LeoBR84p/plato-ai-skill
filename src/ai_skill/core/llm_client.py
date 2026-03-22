@@ -145,6 +145,7 @@ class LLMClient:
         response_model: type[T],
         system: str = "",
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> T:
         """Send a completion request and parse the response into a Pydantic model.
 
@@ -156,6 +157,8 @@ class LLMClient:
             response_model: Pydantic model class to parse the response into.
             system: Optional system prompt.
             max_tokens: Override the default max_tokens for this call.
+            temperature: Sampling temperature in [0.0, 1.0]. Use 0.0 for
+                deterministic, reproducible outputs (e.g. verification agents).
 
         Returns:
             An instance of response_model populated from the LLM response.
@@ -175,6 +178,8 @@ class LLMClient:
                 }
                 if system:
                     kwargs["system"] = system
+                if temperature is not None:
+                    kwargs["temperature"] = temperature
 
                 return self._instructor_client.messages.create(**kwargs)  # type: ignore[return-value]
 

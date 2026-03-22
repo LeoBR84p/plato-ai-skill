@@ -24,5 +24,8 @@ keys/
 # Research workspaces (may contain PII / unpublished data)
 research-workspace/
 
+# Project workspaces — se AI_SKILL_PROJECTS_DIR apontar para dentro deste diretório
+research-projects/
+
 # LangSmith / LangChain local cache
 .langchain.db

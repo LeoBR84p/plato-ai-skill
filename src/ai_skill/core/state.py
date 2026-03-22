@@ -16,6 +16,57 @@ from langgraph.graph.message import add_messages
 from ai_skill.core.pipeline_stages import PipelineStage, ResearchStatus
 
 
+class SourceVerification(TypedDict, total=False):
+    """Verification result for a single bibliographic source.
+
+    Attributes:
+        reference_number: The [N] index of this source in the review.
+        url: The URL that was checked.
+        title: Title extracted from the reference entry.
+        accessible: True if the URL returned a 2xx response.
+        content_matches: True when an independent LLM agent confirmed the
+            fetched content is consistent with what the review claims.
+        verification_note: Short explanation of the verification outcome.
+        access_date: Date of access in ABNT format (e.g. "23 mar. 2026").
+    """
+
+    reference_number: int
+    url: str
+    title: str
+    accessible: bool
+    content_matches: bool
+    verification_note: str
+    access_date: str
+
+
+class LiteratureReviewSection(TypedDict):
+    """One thematic section of the literature review.
+
+    Attributes:
+        section_title: Heading for the section.
+        content: Markdown body with inline [N] citations.
+    """
+
+    section_title: str
+    content: str
+
+
+class LiteratureReviewDoc(TypedDict, total=False):
+    """Structured literature review document produced by CP2.
+
+    Attributes:
+        sections: Ordered list of review sections with inline citations.
+        references: ABNT-formatted reference entries, one per source.
+            Each item is a dict with keys: reference_number, title, authors,
+            year, url, abnt_entry, summary.
+        verified_sources: Verification results per source URL.
+    """
+
+    sections: list[LiteratureReviewSection]
+    references: list[dict[str, Any]]
+    verified_sources: list[SourceVerification]
+
+
 class ResearchObjective(TypedDict, total=False):
     """The research objective as defined and confirmed by the user.
 
@@ -178,6 +229,13 @@ class ResearchState(TypedDict, total=False):
     checkpoint_pending: bool
     user_feedback: str | None
     checkpoint_label: str
+    charter_approved: bool
+
+    # Literature review (Checkpoint 2)
+    literature_approved: bool
+    active_checkpoint: int
+    literature_review_doc: LiteratureReviewDoc
+    charter_document_text: str  # extracted text of CP1 [final].docx — CP2 context
 
     # Document versioning
     document_version: int
@@ -211,6 +269,10 @@ def initial_state(workspace_path: str, topic: str = "") -> ResearchState:
         status=ResearchStatus.PLANNING,
         attempt=0,
         checkpoint_pending=False,
+        charter_approved=False,
+        literature_approved=False,
+        active_checkpoint=1,
+        charter_document_text="",
         user_feedback=None,
         document_version=0,
         workspace_path=str(workspace_path),

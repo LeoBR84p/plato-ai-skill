@@ -77,26 +77,41 @@ class ResearchWorkspace:
     def save_state(self, state: dict[str, Any]) -> None:
         """Persist ResearchState to research-state.yaml atomically.
 
+        Uses yaml.safe_dump so only plain Python types are written — no
+        Python-specific tags that would break yaml.safe_load on reload.
+
         Args:
             state: The research state dict to serialise.
         """
         serialisable = _make_serialisable(state)
-        content = yaml.dump(serialisable, allow_unicode=True, sort_keys=False)
+        content = yaml.safe_dump(serialisable, allow_unicode=True, sort_keys=False)
         self._atomic_write(self._state_file, content)
 
     def load_state(self) -> dict[str, Any] | None:
         """Load a previously persisted ResearchState.
 
+        If the state file contains Python object tags (written by a previous
+        version that used yaml.dump), it is renamed to ``.yaml.corrupt`` and
+        None is returned so the caller can fall back to reconstruction.
+
         Returns:
-            The state dict, or None if no state file exists.
+            The state dict, or None if no state file exists or parse fails.
         """
         if not self._state_file.exists():
             return None
         try:
             text = self._state_file.read_text(encoding="utf-8")
-            return yaml.safe_load(text) or {}
+            result = yaml.safe_load(text)
+            return result or {}
         except Exception as exc:
             logger.error("Failed to load state from %s: %s", self._state_file, exc)
+            # Rename corrupt file so future runs and reconstruction work cleanly
+            try:
+                corrupt = self._state_file.with_suffix(".yaml.corrupt")
+                self._state_file.rename(corrupt)
+                logger.warning("Corrupt state file moved to: %s", corrupt)
+            except OSError:
+                pass
             return None
 
     # ------------------------------------------------------------------
@@ -228,24 +243,47 @@ def _utcnow() -> str:
 
 
 def _make_serialisable(obj: Any) -> Any:
-    """Recursively convert an object to a YAML/JSON-safe structure.
+    """Recursively convert an object to a yaml.safe_dump-compatible structure.
+
+    All values are reduced to plain Python built-ins (dict, list, str, int,
+    float, bool, None).  In particular:
+
+    - ``str`` subclasses (e.g. ``StrEnum``) are cast to plain ``str`` so
+      yaml.safe_dump does not emit ``!python/object/apply:`` tags.
+    - Pydantic models are converted via ``model_dump()``.
+    - Arbitrary objects fall back to their ``__dict__``, then ``str()``.
 
     Args:
         obj: Any Python value.
 
     Returns:
-        A structure composed only of dicts, lists, strings, ints, floats, bools,
-        and None.
+        A structure composed only of plain dicts, lists, str, int, float,
+        bool, and None — safe for yaml.safe_dump.
     """
+    import enum as _enum
+
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    # Check Enum BEFORE str: StrEnum is both str and Enum; we want .value
+    if isinstance(obj, _enum.Enum):
+        return _make_serialisable(obj.value)
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        return obj
+    if isinstance(obj, str):
+        # Return a plain str (not a str subclass) to keep yaml.safe_dump happy
+        return "" + obj  # forces a new plain str object
     if isinstance(obj, dict):
         return {str(k): _make_serialisable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_make_serialisable(v) for v in obj]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
-        return obj
-    # Pydantic models, dataclasses, enums, BaseMessage, etc.
+    # Pydantic models (BaseModel, BaseMessage, etc.)
     if hasattr(obj, "model_dump"):
         return _make_serialisable(obj.model_dump())
+    # Dataclasses and arbitrary objects
     if hasattr(obj, "__dict__"):
         return _make_serialisable(obj.__dict__)
     return str(obj)
