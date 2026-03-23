@@ -38,6 +38,11 @@ Requirements:
    Multiple citations allowed: [1][3][5].
 4. **References list**: Number all sources sequentially [1], [2], … Include only sources
    cited in the text. Every entry must have a direct URL and the placeholder {ACCESS_DATE}.
+   **URL priority** (use the first available for each paper):
+   (a) ``doi`` field → format as ``https://doi.org/{doi}``
+   (b) ``arxiv_id`` field → format as ``https://arxiv.org/abs/{arxiv_id}``
+   (c) ``url`` field from the finding (may be a Semantic Scholar page)
+   Never invent a URL. If none of (a)–(c) is available, omit the URL.
 5. **ABNT NBR 6023:2018 format**:
    - Article: SOBRENOME, Nome. Título. **Periódico**, v. X, n. Y, p. ZZ–ZZ, ano. DOI/URL. {ACCESS_DATE}.
    - Webpage: ORGANIZAÇÃO. **Título**. Local: Editor, ano. Disponível em: <URL>. {ACCESS_DATE}.
@@ -45,6 +50,9 @@ Requirements:
 7. **No fabrication**: Use only information from the provided findings. Do not invent
    authors, years, or claims not supported by the sources.
 8. **Consistency**: same citation style throughout; no mixed numbering.
+9. **Reference summaries**: For every entry in the references list, write a `summary`
+   of up to 200 words describing the article's main argument, methodology, key findings,
+   and relevance to the research objectives — based only on the provided findings.
 """
 
 COMPILE_USER = """\

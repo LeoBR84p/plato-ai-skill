@@ -36,6 +36,8 @@ from ai_skill.core.state import (
     MetricScore,
     PlanStep,
     QualitySnapshot,
+    ResearchDesignDoc,
+    ResearchDesignSection,
     ResearchObjective,
     ResearchState,
     SkillOutput,
@@ -47,6 +49,10 @@ from ai_skill.prompts.alignment import (
     build_charter_refine_messages,
 )
 from ai_skill.prompts.evaluation import build_evaluation_messages
+from ai_skill.prompts.design import (
+    build_compile_design_messages,
+    build_refine_design_messages,
+)
 from ai_skill.prompts.literature import (
     build_compile_messages,
     build_refine_messages,
@@ -128,7 +134,11 @@ class _LiteratureSourceLLM(BaseModel):
                     "including the URL and the placeholder {ACCESS_DATE}."
     )
     summary: str = Field(
-        description="One-sentence summary of what this source contributes to the review."
+        description=(
+            "Summary of the article's content in up to 200 words (pt-BR). "
+            "Describe the main argument, methodology, key findings, and relevance "
+            "to the research objectives — based solely on information in the findings."
+        )
     )
 
 
@@ -163,6 +173,112 @@ class _VerifyResultLLM(BaseModel):
     )
     verification_note: str = Field(
         description="One sentence explaining the verification decision."
+    )
+
+
+class _ResearchDesignVariableLLM(BaseModel):
+    """One variable entry in the Research Design."""
+
+    name: str = Field(description="Variable name.")
+    variable_type: str = Field(
+        description="'independente' | 'dependente' | 'confundidora'."
+    )
+    description: str = Field(description="Plain-language description of the variable.")
+    operationalization: str = Field(
+        description="How the variable is measured or manipulated."
+    )
+    measurement_scale: str = Field(
+        description="nominal | ordinal | intervalar | racional."
+    )
+
+
+class _ResearchDesignMitigationLLM(BaseModel):
+    """One validity threat + mitigation strategy."""
+
+    threat: str = Field(description="Specific validity or reliability threat.")
+    mitigation: str = Field(description="Strategy to address or reduce the threat.")
+    contingency: str = Field(description="Fallback plan if mitigation is insufficient.")
+
+
+class _ResearchDesignSectionLLM(BaseModel):
+    """One section of the Research Design document."""
+
+    section_title: str = Field(description="Section heading in pt-BR.")
+    content: str = Field(description="Body text in pt-BR Markdown prose.")
+
+
+class _ResearchDesignDocLLM(BaseModel):
+    """Full structured Research Design — enforces consistent output format for CP3."""
+
+    sections: list[_ResearchDesignSectionLLM] = Field(
+        min_length=1,
+        description="Ordered sections covering all 9 mandatory headings.",
+    )
+    study_type: str = Field(
+        description=(
+            "experimental | quasi-experimental | observacional | estudo-de-caso | "
+            "pesquisa-ação | revisão-sistemática | misto"
+        )
+    )
+    research_paradigm: str = Field(
+        description="quantitativo | qualitativo | misto"
+    )
+    epistemological_stance: str = Field(
+        description="pós-positivista | construtivista | pragmático | transformativo"
+    )
+    hypotheses: list[str] = Field(
+        default_factory=list,
+        description="Testable hypothesis statements in falsifiable form (H1: …, H2: …).",
+    )
+    research_questions: list[str] = Field(
+        default_factory=list,
+        description="Alternative or complementary research questions.",
+    )
+    variables: list[_ResearchDesignVariableLLM] = Field(
+        default_factory=list,
+        description="All independent, dependent, and confounding variables.",
+    )
+    instruments: list[str] = Field(
+        default_factory=list,
+        description="Data collection instruments with validation references.",
+    )
+    sampling_strategy: str = Field(description="Description of sampling approach and frame.")
+    sample_size_justification: str = Field(
+        description="Power analysis or qualitative saturation rationale."
+    )
+    ethical_considerations: str = Field(
+        description="Consent, privacy, CEP/IRB requirements, LGPD compliance."
+    )
+    validity_threats: list[str] = Field(
+        default_factory=list,
+        description="Internal and external validity threats identified.",
+    )
+    mitigation_strategies: list[_ResearchDesignMitigationLLM] = Field(
+        default_factory=list,
+        description="One entry per validity threat with mitigation and contingency.",
+    )
+    data_management_plan: str = Field(
+        description="FAIR-compliant data management summary."
+    )
+    metrics_and_kpis: list[str] = Field(
+        default_factory=list,
+        description="KPIs, acceptance thresholds, statistical power, minimum sample size.",
+    )
+    data_sources: list[str] = Field(
+        default_factory=list,
+        description="Primary and secondary data sources with quality criteria and FAIR statement.",
+    )
+    collection_protocol: str = Field(
+        description="Step-by-step data collection protocol with instruments and acceptance criteria."
+    )
+    methodology_timeline: str = Field(
+        description="PMBOK-aligned milestone schedule: CP3 (design) → CP4 (coleta) → CP5 (análise)."
+    )
+    reporting_standard: str = Field(
+        description="CONSORT | STROBE | PRISMA | SQUIRE | outro | não aplicável"
+    )
+    target_journal_tier: str = Field(
+        description="Target publication venue quartile (Q1/Q2/Q3/Q4)."
     )
 
 
@@ -360,7 +476,10 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
     _registry = registry or _get_default_registry()
     _llm = llm or LLMClient()
 
-    objective = state.get("objective") or ResearchObjective(
+    # cp2_context is the restricted handoff from CP1: only topic, goals,
+    # scope_constraints.  When present we use it instead of the full objective
+    # so success_metrics and other CP1-only fields are structurally absent.
+    objective = state.get("cp2_context") or state.get("objective") or ResearchObjective(
         topic="", goals=[], success_metrics=[]
     )
     stage = state.get("stage", PipelineStage.LITERATURE_REVIEW)
@@ -370,17 +489,22 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
     gaps = previous_eval.get("gaps", []) if previous_eval else []
     user_guidance = state.get("user_guidance")
 
-    # Use stage-specific guidelines. For LITERATURE_REVIEW, fall back to
-    # bibliographic-only defaults rather than the overall success_metrics,
-    # so the planner never confuses CP2 scope with full project criteria.
-    raw_guidelines = (objective.get("stage_guidelines") or {}).get(stage_str)
-    if raw_guidelines:
-        stage_guidelines: list[str] | None = raw_guidelines
-    elif stage_str == PipelineStage.LITERATURE_REVIEW.value:
-        stage_guidelines = _default_literature_review_guidelines()
+    # For LITERATURE_REVIEW and RESEARCH_DESIGN, always use hardcoded defaults
+    # and ignore whatever the charter LLM generated.  The charter LLM consistently
+    # mirrors global project outcomes into these slots instead of restricting to
+    # stage-specific activities.  Hardcoding prevents the planner from planning
+    # toward "submit article" or "build framework" steps during CP2/CP3.
+    if stage_str == PipelineStage.LITERATURE_REVIEW.value:
+        stage_guidelines: list[str] | None = _default_literature_review_guidelines()
+    elif stage_str == PipelineStage.RESEARCH_DESIGN.value:
+        stage_guidelines = _default_research_design_guidelines()
     else:
-        defaults = _default_stage_guidelines(stage_str)
-        stage_guidelines = defaults if defaults else None
+        raw_guidelines = (objective.get("stage_guidelines") or {}).get(stage_str)
+        if raw_guidelines:
+            stage_guidelines = raw_guidelines
+        else:
+            defaults = _default_stage_guidelines(stage_str)
+            stage_guidelines = defaults if defaults else None
 
     system, messages = build_planning_messages(
         objective=objective,
@@ -397,6 +521,7 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
             messages=messages,
             response_model=_ExecutionPlanLLM,
             system=system,
+            max_tokens=16384,  # plans can be verbose; raise ceiling above default 8192
         )
     except LLMClientError as exc:
         logger.error("Plan generation failed: %s", exc)
@@ -417,6 +542,15 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
         rationale=plan_obj.rationale,
         estimated_cost=plan_obj.estimated_cost,
         attempt=attempt,
+    )
+
+    # Log a plan_start chapter-header entry so llm_history.yaml has one
+    # clear anchor per attempt that groups everything that follows.
+    _history.log_plan_start(
+        attempt=attempt,
+        step_count=len(steps),
+        estimated_cost=plan_obj.estimated_cost,
+        plan_rationale=plan_obj.rationale,
     )
 
     return {
@@ -469,10 +603,15 @@ def execute(
             })
             batch_inputs.append((step["step_id"], skill_input))
 
-        # Run batch concurrently
-        batch_outputs = asyncio.run(
-            _run_batch_async(_registry, batch_inputs)
-        )
+        # Run batch concurrently.
+        # asyncio.run() raises RuntimeError if called inside a running event
+        # loop (e.g. when LangGraph is invoked from an async context).
+        # Running it in a ThreadPoolExecutor thread guarantees a fresh loop.
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+            batch_outputs = _pool.submit(
+                asyncio.run, _run_batch_async(_registry, batch_inputs)
+            ).result()
         outputs.update(batch_outputs)
 
         # Log each skill execution to llm_history.yaml
@@ -486,6 +625,8 @@ def execute(
                     skill=step.get("skill_name", "unknown"),
                     stage=stage_str_exec,
                     attempt=attempt,
+                    step_id=step.get("step_id", -1),
+                    step_rationale=step.get("rationale", ""),
                     request_sent={
                         k: v for k, v in step.get("parameters", {}).items()
                         if k not in ("content",)  # omit large text blobs
@@ -525,7 +666,9 @@ def evaluate(
     """
     _configure_history(state, "evaluate")
     _llm = llm or LLMClient()
-    objective = state.get("objective") or ResearchObjective(
+    # cp2_context is the restricted handoff from CP1 (topic, goals, scope_constraints only).
+    # Using it here prevents success_metrics from ever reaching the evaluator prompt.
+    objective = state.get("cp2_context") or state.get("objective") or ResearchObjective(
         topic="", goals=[], success_metrics=[]
     )
     # Use only the current attempt's findings for evaluation so that poor results
@@ -536,17 +679,19 @@ def evaluate(
     stage = state.get("stage", PipelineStage.LITERATURE_REVIEW)
     stage_str = str(stage.value if hasattr(stage, "value") else stage)
 
-    # Use stage-specific guidelines. For LITERATURE_REVIEW, fall back to
-    # bibliographic-only defaults so evaluation never mixes CP2 scope with
-    # full project criteria (implementation, publication, etc.).
-    raw_guidelines = (objective.get("stage_guidelines") or {}).get(stage_str)
-    if raw_guidelines:
-        stage_guidelines: list[str] | None = raw_guidelines
-    elif stage_str == PipelineStage.LITERATURE_REVIEW.value:
-        stage_guidelines = _default_literature_review_guidelines()
+    # For LITERATURE_REVIEW and RESEARCH_DESIGN, always use hardcoded defaults.
+    # See comment in plan() for the full rationale — same root cause applies here.
+    if stage_str == PipelineStage.LITERATURE_REVIEW.value:
+        stage_guidelines: list[str] | None = _default_literature_review_guidelines()
+    elif stage_str == PipelineStage.RESEARCH_DESIGN.value:
+        stage_guidelines = _default_research_design_guidelines()
     else:
-        defaults = _default_stage_guidelines(stage_str)
-        stage_guidelines = defaults if defaults else None
+        raw_guidelines = (objective.get("stage_guidelines") or {}).get(stage_str)
+        if raw_guidelines:
+            stage_guidelines = raw_guidelines
+        else:
+            defaults = _default_stage_guidelines(stage_str)
+            stage_guidelines = defaults if defaults else None
 
     system, messages = build_evaluation_messages(
         objective=objective,
@@ -727,6 +872,8 @@ def compile_literature(
                     "title": p.get("title", ""),
                     "abstract": (p.get("abstract", "") or "")[:300],
                     "url": p.get("url", ""),
+                    "doi": p.get("doi") or "",           # prefer doi.org URL for verify
+                    "arxiv_id": p.get("arxiv_id") or "", # prefer arxiv.org URL for verify
                     "year": p.get("year"),
                     "authors": p.get("authors", [])[:3],
                     "venue": p.get("venue", ""),
@@ -757,22 +904,48 @@ def compile_literature(
             response_model=_LiteratureReviewLLM,
             system=system,
             temperature=0.3,
+            max_tokens=16384,
         )
     except LLMClientError as exc:
         logger.error("Literature review compilation failed: %s", exc)
-        return {"status": ResearchStatus.FAILED}
+        return {"status": ResearchStatus.FAILED, "literature_review_doc": LiteratureReviewDoc(sections=[], references=[], verified_sources=[])}
 
     sections: list[LiteratureReviewSection] = [
         LiteratureReviewSection(section_title=s.section_title, content=s.content)
         for s in review_obj.sections
     ]
+    # Build a title → finding lookup so we can repair LLM-generated URLs
+    _finding_by_title: dict[str, dict[str, Any]] = {}
+    for f in top_findings:
+        if f.get("skill_name") == "article_search":
+            for p in (f.get("result") or {}).get("papers", []):
+                t = (p.get("title") or "").lower().strip()
+                if t:
+                    _finding_by_title[t] = p
+
+    def _best_url(llm_url: str, title: str) -> str:
+        """Return the most API-resolvable URL for a reference."""
+        # If the LLM URL already looks like a DOI or arXiv link, keep it
+        if any(kw in llm_url for kw in ("doi.org", "arxiv.org", "semanticscholar.org")):
+            return llm_url
+        # Try to find the paper in findings by title and use its DOI/arXiv/S2 URL
+        finding = _finding_by_title.get(title.lower().strip())
+        if finding:
+            if finding.get("doi"):
+                return f"https://doi.org/{finding['doi']}"
+            if finding.get("arxiv_id"):
+                return f"https://arxiv.org/abs/{finding['arxiv_id']}"
+            if finding.get("url"):
+                return finding["url"]
+        return llm_url  # keep as-is — HTTP fallback will try it
+
     references: list[dict[str, Any]] = [
         {
             "reference_number": r.reference_number,
             "title": r.title,
             "authors": r.authors,
             "year": r.year,
-            "url": r.url,
+            "url": _best_url(r.url or "", r.title or ""),
             "abnt_entry": r.abnt_entry,
             "summary": r.summary,
         }
@@ -814,6 +987,17 @@ def verify_literature(
     This node is intentionally separate from ``compile_literature`` so that
     the verification agent cannot rationalise its own previous claims.
 
+    Smart re-verification rules (correction cycle only — when previous
+    ``verified_sources`` already exist):
+
+    - ✓ Green tick (accessible + content_matches): skip unless the reference
+      is explicitly mentioned in ``user_feedback`` (comment context).
+    - ⚠ Warning (accessible, content divergence): skip unless the reference
+      appears in ``user_feedback`` (user highlighted/commented that section).
+    - ✗ Red X (inaccessible): retry if *any* feedback/marks exist in the
+      document (``user_feedback`` non-empty); skip if there are no marks at all.
+    - New reference (not in previous verified_sources): always verify.
+
     Args:
         state: Current ResearchState with ``literature_review_doc``.
         llm: Optional injected LLMClient (for testing).
@@ -821,6 +1005,8 @@ def verify_literature(
     Returns:
         Partial state update with verified ``literature_review_doc``.
     """
+    import re as _re
+
     _configure_history(state, "verify_literature")
     _llm = llm or LLMClient()
     review_doc: dict[str, Any] = dict(state.get("literature_review_doc") or {})
@@ -837,6 +1023,29 @@ def verify_literature(
         abnt_entry = ref.get("abnt_entry", "")
         ref["abnt_entry"] = abnt_entry.replace("{ACCESS_DATE}", access_date)
 
+    # Build lookup of previously verified sources (empty on initial pass)
+    prev_verified: list[dict[str, Any]] = list(review_doc.get("verified_sources") or [])
+    prev_by_num: dict[int, dict[str, Any]] = {
+        v.get("reference_number", 0): dict(v) for v in prev_verified
+    }
+    is_correction_cycle = bool(prev_by_num)
+
+    # Determine feedback context for smart skipping
+    user_feedback: str = state.get("user_feedback") or ""
+    has_any_marks = bool(user_feedback)
+
+    # Reference numbers explicitly mentioned in feedback (comment context)
+    feedback_ref_nums: set[int] = set()
+    if user_feedback:
+        for m in _re.findall(r"\[(\d+)\]", user_feedback):
+            feedback_ref_nums.add(int(m))
+        for m in _re.findall(
+            r"(?:fonte|ref(?:er[eê]ncia)?|source|recheck|verificar|checar)\s+(\d+)",
+            user_feedback,
+            _re.IGNORECASE,
+        ):
+            feedback_ref_nums.add(int(m))
+
     def _verify_one(ref: dict[str, Any]) -> SourceVerification:
         """Verify a single reference — runs in a thread pool worker."""
         url = ref.get("url", "")
@@ -844,7 +1053,42 @@ def verify_literature(
         title = ref.get("title", "")
         summary = ref.get("summary", "")
 
-        accessible, fetched_content = _fetch_url_content(url)
+        # --- Smart skip logic (correction cycle only) ---
+        if is_correction_cycle:
+            prev = prev_by_num.get(ref_num)
+            in_comment = ref_num in feedback_ref_nums
+
+            if prev is not None and not in_comment:
+                was_accessible = prev.get("accessible", False)
+                was_match = prev.get("content_matches", False)
+
+                # ✓ Green tick: skip — already verified correctly
+                if was_accessible and was_match:
+                    logger.debug(
+                        "verify_literature: [%d] ✓ already verified — skipping.", ref_num
+                    )
+                    return SourceVerification(**prev)
+
+                # ⚠ Warning: skip — no comment/highlight for this section
+                if was_accessible and not was_match:
+                    logger.debug(
+                        "verify_literature: [%d] ⚠ no comment context — skipping.", ref_num
+                    )
+                    return SourceVerification(**prev)
+
+                # ✗ Red X: retry only when marks/feedback exist in the document
+                if not was_accessible:
+                    if not has_any_marks:
+                        logger.debug(
+                            "verify_literature: [%d] ✗ no marks in document — skipping.", ref_num
+                        )
+                        return SourceVerification(**prev)
+                    logger.debug(
+                        "verify_literature: [%d] ✗ retrying (marks present).", ref_num
+                    )
+
+        # --- Perform actual fetch + LLM verification ---
+        accessible, fetched_content, access_method = _fetch_url_content(url)
 
         content_matches = False
         note = "URL não acessível — verificação automática não foi possível."
@@ -880,6 +1124,7 @@ def verify_literature(
             content_matches=content_matches,
             verification_note=note,
             access_date=access_date,
+            access_method=access_method,
         )
 
     verified: list[SourceVerification] = []
@@ -923,6 +1168,10 @@ def deliver_literature(state: ResearchState) -> dict[str, Any]:
     review_doc: dict[str, Any] = state.get("literature_review_doc") or {}
     workspace_path = state.get("workspace_path", "")
     checkpoint_docx_path = ""
+
+    if not review_doc.get("sections"):
+        logger.warning("deliver_literature: empty review doc — skipping docx generation.")
+        return {"checkpoint_label": "", "literature_approved": False, "status": ResearchStatus.FAILED}
 
     if workspace_path:
         docx_bytes = _literature_review_to_docx(review_doc)
@@ -995,6 +1244,7 @@ def refine_literature(
             response_model=_LiteratureReviewLLM,
             system=system,
             temperature=0.3,
+            max_tokens=16384,
         )
     except LLMClientError as exc:
         logger.error("Literature review refinement failed: %s", exc)
@@ -1017,10 +1267,13 @@ def refine_literature(
         for r in refined_obj.references
     ]
 
+    # Preserve existing verified_sources so verify_literature can apply
+    # smart skip logic (green ticks are not re-fetched unnecessarily).
+    existing_verified = list(review_doc.get("verified_sources") or [])
     updated_doc = LiteratureReviewDoc(
         sections=sections,
         references=references,
-        verified_sources=[],
+        verified_sources=existing_verified,
     )
 
     workspace_path = state.get("workspace_path", "")
@@ -1043,9 +1296,422 @@ def route_after_review_literature(state: ResearchState) -> str:
         state: Current ResearchState after ``review_literature`` ran.
 
     Returns:
-        ``"END"`` if approved, ``"refine_literature"`` if revision needed.
+        ``"END"`` if approved, ``"recheck_sources"`` if revision needed
+        (recheck_sources is a no-op when feedback contains no recheck instructions,
+        then always continues to refine_literature).
     """
-    return "END" if state.get("literature_approved") else "refine_literature"
+    return "END" if state.get("literature_approved") else "recheck_sources"
+
+
+def recheck_sources(state: ResearchState) -> dict[str, Any]:
+    """Re-fetch specific sources via Semantic Scholar API when the user requests a recheck.
+
+    Parses ``user_feedback`` for reference numbers using patterns such as
+    ``[N]``, ``fonte N``, ``referência N``, or ``recheck N``.  For each
+    mentioned reference, calls ``_fetch_via_semantic_scholar_api`` to obtain
+    fresh metadata (abstract, authors, year) and updates the corresponding
+    entry in ``verified_sources``.
+
+    This node is always called in the revision path (even without explicit recheck
+    instructions), acting as a no-op when no reference numbers are found.
+    ``refine_literature`` runs next to apply any prose corrections.
+
+    Args:
+        state: Current ResearchState with ``user_feedback`` and
+            ``literature_review_doc``.
+
+    Returns:
+        Partial state update with ``literature_review_doc`` updated (verified_sources
+        refreshed for mentioned references), or ``{}`` if no references were targeted.
+    """
+    import re
+
+    feedback = state.get("user_feedback") or ""
+    review_doc: dict[str, Any] = dict(state.get("literature_review_doc") or {})
+    references: list[dict[str, Any]] = list(review_doc.get("references", []))
+    verified: list[dict[str, Any]] = list(review_doc.get("verified_sources", []))
+
+    # Parse reference numbers from feedback
+    ref_nums: set[int] = set()
+    for m in re.findall(r"\[(\d+)\]", feedback):
+        ref_nums.add(int(m))
+    for m in re.findall(
+        r"(?:fonte|ref(?:er[eê]ncia)?|source|recheck|verificar|checar)\s+(\d+)",
+        feedback,
+        re.IGNORECASE,
+    ):
+        ref_nums.add(int(m))
+
+    if not ref_nums:
+        logger.info("recheck_sources: no reference numbers found in feedback — skipping.")
+        return {}
+
+    logger.info("recheck_sources: rechecking references %s", sorted(ref_nums))
+    refs_by_num: dict[int, dict[str, Any]] = {
+        r.get("reference_number", 0): r for r in references
+    }
+    verified_by_num: dict[int, dict[str, Any]] = {
+        v.get("reference_number", 0): dict(v) for v in verified
+    }
+    access_date = _abnt_access_date()
+
+    for ref_num in ref_nums:
+        ref = refs_by_num.get(ref_num)
+        if ref is None:
+            logger.debug("recheck_sources: reference [%d] not found in review doc.", ref_num)
+            continue
+
+        url = ref.get("url", "")
+        result = _fetch_via_semantic_scholar_api(url)
+        if result is not None:
+            accessible, content, method = result
+        else:
+            accessible, content, method = _fetch_url_content(url)
+
+        existing = verified_by_num.get(ref_num, {})
+        existing.update({
+            "reference_number": ref_num,
+            "url": url,
+            "title": ref.get("title", existing.get("title", "")),
+            "accessible": accessible,
+            "content_matches": existing.get("content_matches", False),  # preserve LLM result
+            "verification_note": (
+                f"Rechecado via {method}. "
+                + (existing.get("verification_note") or "")
+            )[:500],
+            "access_date": access_date,
+            "access_method": method,
+        })
+        verified_by_num[ref_num] = existing
+        logger.info(
+            "recheck_sources: [%d] %s — accessible=%s method=%s",
+            ref_num, url[:60], accessible, method,
+        )
+
+    review_doc["verified_sources"] = list(verified_by_num.values())
+    workspace_path = state.get("workspace_path", "")
+    if workspace_path:
+        ResearchWorkspace(Path(workspace_path)).log(
+            f"Source recheck: {len(ref_nums)} reference(s) rechecked via API."
+        )
+
+    return {"literature_review_doc": LiteratureReviewDoc(**review_doc)}
+
+
+# ---------------------------------------------------------------------------
+# CP3 — Research Design nodes
+# ---------------------------------------------------------------------------
+
+
+def cp3_router(_state: ResearchState) -> dict[str, Any]:
+    """Entry-point no-op for CP3; routing logic lives in route_cp3_start.
+
+    Args:
+        state: Current ResearchState (unused — routing done in conditional edge).
+
+    Returns:
+        Empty dict (no state changes).
+    """
+    return {}
+
+
+def route_cp3_start(state: ResearchState) -> str:
+    """Conditional edge from cp3_router: fresh start vs. correction cycle.
+
+    Args:
+        state: Current ResearchState.
+
+    Returns:
+        ``"refine_design"`` when a design doc and user feedback already exist;
+        ``"plan"`` otherwise.
+    """
+    if state.get("research_design_doc") and state.get("user_feedback"):
+        return "refine_design"
+    return "plan"
+
+
+def compile_design(
+    state: ResearchState,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Synthesise methodology research findings into the Research Design document.
+
+    Called when the evaluate node converges. Reads the top-40 findings plus
+    the CP1 and CP2 approved documents, then calls the LLM to produce a fully
+    structured ``ResearchDesignDoc`` covering all 9 mandatory sections.
+
+    Args:
+        state: Current ResearchState with converged findings.
+        llm: Optional LLMClient override (uses default when None).
+
+    Returns:
+        Partial state update with ``research_design_doc`` and ``active_checkpoint=3``.
+    """
+    _configure_history(state, "compile_design")
+    _llm = llm or LLMClient()
+
+    workspace_path = state.get("workspace_path", "")
+
+    # Build context from CP1 and CP2 approved documents
+    charter_text = state.get("charter_document_text") or ""
+
+    # Extract CP2 text from cp3_context if available, else stringify the doc
+    cp3_context = state.get("cp3_context") or {}
+    literature_text = cp3_context.get("literature_summary") or ""
+    if not literature_text:
+        review_doc = state.get("literature_review_doc") or {}
+        sections = review_doc.get("sections", [])
+        literature_text = "\n\n".join(
+            f"## {s.get('section_title', '')}\n{s.get('content', '')}"
+            for s in sections
+        )
+
+    # Take top 40 findings by confidence
+    all_findings = state.get("findings") or []
+    sorted_findings = sorted(
+        all_findings,
+        key=lambda f: float(f.get("confidence", 0.0)),
+        reverse=True,
+    )
+    top_findings = sorted_findings[:40]
+
+    # Build a compact representation for each finding
+    compact_findings: list[dict[str, Any]] = []
+    for f in top_findings:
+        result = f.get("result") or {}
+        skill = f.get("skill_name", "")
+        summary: dict[str, Any] = {"skill": skill, "confidence": f.get("confidence", 0.0)}
+        if skill == "article_search":
+            papers = result.get("papers", [])[:5]
+            summary["papers"] = [
+                {"title": p.get("title"), "year": p.get("year"), "abstract": (p.get("abstract") or "")[:300]}
+                for p in papers
+            ]
+        elif skill == "content_summarizer":
+            summary["summary"] = (result.get("summary") or "")[:400]
+            summary["key_points"] = result.get("key_points", [])[:5]
+        else:
+            # Generic: first 5 keys truncated
+            for k, v in list(result.items())[:5]:
+                summary[k] = str(v)[:400] if isinstance(v, str) else v
+        compact_findings.append(summary)
+
+    system, messages = build_compile_design_messages(
+        charter_document_text=charter_text,
+        literature_document_text=literature_text,
+        cp3_context=cp3_context,
+        findings=compact_findings,
+    )
+
+    try:
+        design_obj: _ResearchDesignDocLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_ResearchDesignDocLLM,
+            system=system,
+            max_tokens=16384,
+        )
+    except LLMClientError as exc:
+        logger.error("compile_design failed: %s", exc)
+        return {"status": ResearchStatus.FAILED}
+
+    sections: list[ResearchDesignSection] = [
+        ResearchDesignSection(
+            section_title=s.section_title,
+            content=s.content,
+        )
+        for s in design_obj.sections
+    ]
+
+    design_doc = ResearchDesignDoc(
+        sections=sections,
+        study_type=design_obj.study_type,
+        research_paradigm=design_obj.research_paradigm,
+        epistemological_stance=design_obj.epistemological_stance,
+        hypotheses=design_obj.hypotheses,
+        research_questions=design_obj.research_questions,
+        variables=[v.model_dump() for v in design_obj.variables],
+        instruments=design_obj.instruments,
+        sampling_strategy=design_obj.sampling_strategy,
+        sample_size_justification=design_obj.sample_size_justification,
+        ethical_considerations=design_obj.ethical_considerations,
+        validity_threats=design_obj.validity_threats,
+        mitigation_strategies=[m.model_dump() for m in design_obj.mitigation_strategies],
+        data_management_plan=design_obj.data_management_plan,
+        metrics_and_kpis=design_obj.metrics_and_kpis,
+        data_sources=design_obj.data_sources,
+        collection_protocol=design_obj.collection_protocol,
+        methodology_timeline=design_obj.methodology_timeline,
+        reporting_standard=design_obj.reporting_standard,
+        target_journal_tier=design_obj.target_journal_tier,
+    )
+
+    if workspace_path:
+        ResearchWorkspace(Path(workspace_path)).log(
+            f"Research design compiled: {len(sections)} sections, "
+            f"{len(design_obj.hypotheses)} hypotheses, "
+            f"{len(design_obj.variables)} variables."
+        )
+
+    return {
+        "research_design_doc": design_doc,
+        "active_checkpoint": 3,
+        "status": ResearchStatus.EXECUTING,
+    }
+
+
+def deliver_design(state: ResearchState) -> dict[str, Any]:
+    """Generate the Research Design .docx checkpoint preview.
+
+    Converts the ``research_design_doc`` to a formatted Word document and
+    saves it as ``Checkpoint 3 - Research Design [preview_N].docx``.
+
+    Args:
+        state: Current ResearchState with a populated ``research_design_doc``.
+
+    Returns:
+        Partial state update with checkpoint label and ``design_approved=False``.
+    """
+    _configure_history(state, "deliver_design")
+
+    design_doc = state.get("research_design_doc") or {}
+    workspace_path = state.get("workspace_path", "")
+
+    docx_bytes = _research_design_to_docx(design_doc)
+
+    checkpoint_label = ""
+    if workspace_path:
+        pw = _get_project_workspace(workspace_path)
+        if pw and docx_bytes:
+            checkpoint_path = pw.save_checkpoint_preview(3, docx_bytes)
+            checkpoint_label = str(checkpoint_path)
+            logger.info("Research design checkpoint saved: %s", checkpoint_label)
+
+    return {
+        "checkpoint_label": checkpoint_label,
+        "design_approved": False,
+        "status": ResearchStatus.PLANNING,
+    }
+
+
+def review_design(state: ResearchState) -> dict[str, Any]:
+    """Gate node: check whether the researcher approved the Research Design.
+
+    This node runs after the ``interrupt_before`` checkpoint fires and the user
+    resumes the graph. If ``user_feedback`` is present, the design needs
+    revision; otherwise it is considered approved.
+
+    Args:
+        state: Current ResearchState, resumed by the user.
+
+    Returns:
+        Partial state update setting ``design_approved`` and ``status``.
+    """
+    _configure_history(state, "review_design")
+
+    if state.get("user_feedback"):
+        return {
+            "design_approved": False,
+            "status": ResearchStatus.PLANNING,
+        }
+    return {
+        "design_approved": True,
+        "status": ResearchStatus.COMPLETED,
+    }
+
+
+def refine_design(
+    state: ResearchState,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Apply researcher corrections to the Research Design document.
+
+    Called when the user provides feedback at the Checkpoint 3 review gate.
+    Applies surgical corrections while preserving all unmarked content.
+
+    Args:
+        state: Current ResearchState with ``research_design_doc`` and ``user_feedback``.
+        llm: Optional LLMClient override.
+
+    Returns:
+        Partial state update with the refined ``research_design_doc`` and
+        ``user_feedback=None``.
+    """
+    _configure_history(state, "refine_design")
+    _llm = llm or LLMClient()
+
+    design_doc = state.get("research_design_doc") or {}
+    feedback = state.get("user_feedback") or ""
+    workspace_path = state.get("workspace_path", "")
+
+    system, messages = build_refine_design_messages(
+        design_doc=dict(design_doc),
+        feedback=feedback,
+    )
+
+    try:
+        design_obj: _ResearchDesignDocLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_ResearchDesignDocLLM,
+            system=system,
+            max_tokens=16384,
+        )
+    except LLMClientError as exc:
+        logger.error("refine_design failed: %s", exc)
+        return {"status": ResearchStatus.FAILED}
+
+    sections: list[ResearchDesignSection] = [
+        ResearchDesignSection(
+            section_title=s.section_title,
+            content=s.content,
+        )
+        for s in design_obj.sections
+    ]
+
+    updated_doc = ResearchDesignDoc(
+        sections=sections,
+        study_type=design_obj.study_type,
+        research_paradigm=design_obj.research_paradigm,
+        epistemological_stance=design_obj.epistemological_stance,
+        hypotheses=design_obj.hypotheses,
+        research_questions=design_obj.research_questions,
+        variables=[v.model_dump() for v in design_obj.variables],
+        instruments=design_obj.instruments,
+        sampling_strategy=design_obj.sampling_strategy,
+        sample_size_justification=design_obj.sample_size_justification,
+        ethical_considerations=design_obj.ethical_considerations,
+        validity_threats=design_obj.validity_threats,
+        mitigation_strategies=[m.model_dump() for m in design_obj.mitigation_strategies],
+        data_management_plan=design_obj.data_management_plan,
+        metrics_and_kpis=design_obj.metrics_and_kpis,
+        data_sources=design_obj.data_sources,
+        collection_protocol=design_obj.collection_protocol,
+        methodology_timeline=design_obj.methodology_timeline,
+        reporting_standard=design_obj.reporting_standard,
+        target_journal_tier=design_obj.target_journal_tier,
+    )
+
+    if workspace_path:
+        ResearchWorkspace(Path(workspace_path)).log(
+            "Research design refined based on researcher corrections."
+        )
+
+    return {
+        "research_design_doc": updated_doc,
+        "user_feedback": None,
+        "status": ResearchStatus.EXECUTING,
+    }
+
+
+def route_after_review_design(state: ResearchState) -> str:
+    """Conditional edge: decide next node after research design review gate.
+
+    Args:
+        state: Current ResearchState after ``review_design`` ran.
+
+    Returns:
+        ``"END"`` if approved, ``"refine_design"`` if revision needed.
+    """
+    return "END" if state.get("design_approved") else "refine_design"
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1733,31 @@ def route_after_evaluate(state: ResearchState) -> str:
 
     if evaluation and evaluation.get("converged"):
         return "compile_literature"
+    if attempt >= max_retries:
+        return "request_support"
+    return "plan"
+
+
+def route_after_evaluate_cp3(state: ResearchState) -> str:
+    """Conditional edge: decide next node after evaluation in CP3.
+
+    Thin wrapper around the same logic as ``route_after_evaluate`` but routes
+    to ``"compile_design"`` on convergence instead of ``"compile_literature"``.
+    Kept separate to avoid modifying the CP2 routing function which is in
+    production use.
+
+    Args:
+        state: Current ResearchState with evaluation result.
+
+    Returns:
+        Name of the next node: "compile_design", "plan", or "request_support".
+    """
+    evaluation = state.get("evaluation")
+    attempt = state.get("attempt", 0)
+    max_retries = int(os.environ.get("AI_SKILL_MAX_RETRIES", "5"))
+
+    if evaluation and evaluation.get("converged"):
+        return "compile_design"
     if attempt >= max_retries:
         return "request_support"
     return "plan"
@@ -1217,6 +1908,51 @@ def _default_literature_review_guidelines() -> list[str]:
     ]
 
 
+def _default_research_design_guidelines() -> list[str]:
+    """Return PMBOK/ISO/OR-aligned methodology guidelines for CP3 (Research Design).
+
+    Used instead of any charter-generated version to prevent the planner from
+    broadening CP3 scope into data collection, analysis, or article writing.
+    All 8 directives are scoped to design-phase deliverables only.
+    """
+    return [
+        # OR Stage 2: model construction — method selection
+        "Selecionar e justificar o método de pesquisa (experimental/quasi-experimental/"
+        "observacional/estudo-de-caso/pesquisa-ação/revisão-sistemática/misto) com base "
+        "explícita na literatura revisada (CP2) e no objetivo de pesquisa (CP1).",
+
+        # OR Stage 2: hypothesis formulation
+        "Formular ao menos 2 hipóteses (H1, H2, …) ou questões de pesquisa testáveis, "
+        "com definições operacionais precisas e formato falsificável.",
+
+        # Variable identification with measurement scales
+        "Identificar e tabular todas as variáveis independentes (VI), dependentes (VD) "
+        "e confundidoras com: nome, tipo, operacionalização e escala de medição "
+        "(nominal/ordinal/intervalar/racional).",
+
+        # Metrics and data goals (ISO 9001:2015 acceptance criteria)
+        "Definir KPIs, limiares de aceitação, poder estatístico e tamanho amostral "
+        "mínimo com justificativa (análise de poder ou critério de saturação qualitativa).",
+
+        # Data sources with FAIR compliance
+        "Especificar fontes de dados primárias e secundárias com critérios de qualidade "
+        "(credibilidade, recência, acessibilidade) e conformidade FAIR "
+        "(Findable, Accessible, Interoperable, Reusable).",
+
+        # Validity and reliability (ISO 9001:2015)
+        "Identificar ameaças à validade interna e externa, confiabilidade e "
+        "replicabilidade; propor estratégias de mitigação e protocolo de replicação.",
+
+        # Ethics (LGPD / IRB)
+        "Enumerar considerações éticas: requisitos de CEP/IRB, conformidade LGPD, "
+        "consentimento informado e conflitos de interesse.",
+
+        # PMBOK Planning: methodology timeline
+        "Propor cronograma metodológico com marcos PMBOK (Planning → Executing) "
+        "alinhando CP3 (design) → CP4 (coleta) → CP5 (análise), com estimativas de prazo.",
+    ]
+
+
 def _default_stage_guidelines(stage_str: str) -> list[str]:
     """Return generic stage-specific guidelines for stages without custom directives.
 
@@ -1299,51 +2035,285 @@ def _abnt_access_date() -> str:
     return f"Acesso em: {now.day} {_month_abbr[now.month - 1]} {now.year}."
 
 
-def _fetch_url_content(url: str, timeout: int = 10) -> tuple[bool, str]:
-    """Fetch a URL and return (accessible, text_snippet).
+def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text from a PDF byte string using PyMuPDF (first 5 pages).
 
-    A best-effort fetch: returns up to 3000 characters of the response body.
-    Non-HTML content (PDFs, binaries) is returned as an empty snippet with
-    ``accessible=True`` so the caller still marks the URL as reachable.
+    Returns up to 3000 characters of extracted text, or empty string on error.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return ""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages_text: list[str] = []
+        for page_num in range(min(5, len(doc))):
+            pages_text.append(doc[page_num].get_text())
+        return "\n".join(pages_text)[:3000]
+    except Exception as exc:
+        logger.debug("PyMuPDF extraction failed: %s", exc)
+        return ""
+
+
+def _find_pdf_links_in_html(html: str, base_url: str) -> list[str]:
+    """Parse an HTML page and return candidate PDF/download URLs.
+
+    Looks for ``<a>`` tags whose href ends in ``.pdf`` or whose text/href
+    contains keywords like ``pdf``, ``download``, ``full-text``, ``fulltext``,
+    ``full_text``, ``preprint``, ``manuscript``.
+
+    Returns up to 5 unique absolute URLs.
+    """
+    try:
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+    except ImportError:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    seen: set[str] = set()
+    results: list[str] = []
+
+    _LINK_KEYWORDS = (
+        "pdf", "download", "full-text", "fulltext", "full_text",
+        "preprint", "manuscript", "article", "paper",
+    )
+
+    for a in soup.find_all("a", href=True):
+        href: str = a.get("href", "").strip()
+        if not href:
+            continue
+        text = a.get_text(" ", strip=True).lower()
+        href_lower = href.lower()
+
+        is_candidate = (
+            href_lower.endswith(".pdf")
+            or any(kw in href_lower for kw in _LINK_KEYWORDS)
+            or any(kw in text for kw in _LINK_KEYWORDS)
+        )
+        if not is_candidate:
+            continue
+
+        full_url = urljoin(base_url, href)
+        if full_url.startswith(("http://", "https://")) and full_url not in seen:
+            seen.add(full_url)
+            results.append(full_url)
+            if len(results) >= 5:
+                break
+
+    return results
+
+
+_S2_PAPER_API = "https://api.semanticscholar.org/graph/v1/paper"
+_S2_PAPER_FIELDS = "title,authors,abstract,year,openAccessPdf"
+
+
+def _fetch_via_semantic_scholar_api(url: str, timeout: int = 15) -> tuple[bool, str, str] | None:
+    """Fetch paper metadata from the Semantic Scholar API when the URL is recognised.
+
+    Supports:
+    - ``semanticscholar.org/paper/{id}`` — direct S2 paper page
+    - ``doi.org/{doi}`` or any URL containing ``/doi/`` — DOI lookup
+    - ``arxiv.org/abs/{id}`` or ``arxiv.org/pdf/{id}`` — arXiv lookup
+
+    Args:
+        url: The reference URL to try.
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        ``(True, abstract_text, access_method)`` on success, or ``None`` if
+        the URL is not a recognised S2-resolvable source.
+    """
+    import os
+    import re
+    import time
+    import urllib.request
+    import urllib.error
+    from urllib.parse import urlparse, unquote
+
+    paper_id: str | None = None
+
+    # ── Semantic Scholar paper page ──────────────────────────────────────────
+    # URL format: /paper/{optional-title-slug}/{40-char-hex-id}
+    # The paper ID is the LAST pure-alphanumeric path segment (≥20 chars).
+    if "semanticscholar.org" in url:
+        path_segments = [s for s in urlparse(url).path.split("/") if s]
+        # Paper ID is hex-only, ≥20 chars; title slug segments contain hyphens
+        s2_candidates = [s for s in path_segments if re.match(r"^[A-Za-z0-9]{20,}$", s)]
+        if s2_candidates:
+            paper_id = s2_candidates[-1]
+
+    # ── DOI (doi.org/10.xxxx/... or /doi/ path) ──────────────────────────────
+    if paper_id is None:
+        m = re.search(r"(?:^|/)(?:doi\.org/|doi/)(10\.\d{4,}/[^\s?#]+)", url)
+        if m:
+            paper_id = f"DOI:{unquote(m.group(1)).rstrip('/')}"
+
+    # ── arXiv ────────────────────────────────────────────────────────────────
+    if paper_id is None:
+        m = re.search(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", url)
+        if m:
+            paper_id = f"arXiv:{m.group(1).split('v')[0]}"
+
+    if paper_id is None:
+        return None  # not a recognised S2-resolvable source
+
+    api_url = f"{_S2_PAPER_API}/{paper_id}?fields={_S2_PAPER_FIELDS}"
+    headers: dict[str, str] = {"Accept": "application/json"}
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    # Rate limit: 1 req/s without API key, 10 req/s with key
+    _interval = 0.1 if api_key else 1.1
+    time.sleep(_interval)
+
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            import json as _json
+            data: dict = _json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        logger.debug("S2 API error for %s (paper_id=%s): %s", url, paper_id, exc)
+        return False, "", "Semantic_Scholar_API"
+    except Exception as exc:
+        logger.debug("S2 API fetch failed for %s: %s", url, exc)
+        return None  # let the caller fall back to HTTP
+
+    abstract = data.get("abstract") or ""
+    title = data.get("title") or ""
+    authors_raw = data.get("authors") or []
+    authors_str = ", ".join(a.get("name", "") for a in authors_raw[:3])
+    year = data.get("year") or ""
+
+    text = f"Title: {title}\nAuthors: {authors_str}\nYear: {year}\n\nAbstract:\n{abstract}"
+    return True, text[:3000], "Semantic_Scholar_API"
+
+
+def _fetch_url_content(url: str, timeout: int = 15) -> tuple[bool, str, str]:
+    """Fetch a URL and return (accessible, text_snippet, access_method).
+
+    Strategy (in order):
+    0. For Semantic Scholar / DOI / arXiv URLs: use the S2 Graph API to obtain
+       the paper abstract — avoids bot-blocking on journal landing pages.
+    1. Direct HTTP fetch with retry on 429 (up to 2 retries, 5 s wait each).
+    2. If the response is a PDF (Content-Type or .pdf URL), extract text via
+       PyMuPDF instead of returning an empty snippet.
+    3. If the HTML page contains PDF/download links, follow the first one that
+       yields extractable PDF content — marked as "PDF_fallback".
 
     Args:
         url: The URL to fetch.
-        timeout: Request timeout in seconds.
+        timeout: Per-request timeout in seconds.
 
     Returns:
-        Tuple of (accessible, text_snippet).  ``accessible`` is True when
-        the server returned any 2xx response.  ``text_snippet`` is up to
-        3000 chars of decoded body (empty on error or binary content).
+        Tuple of (accessible, text_snippet, access_method).
+        ``accessible`` — True when any 2xx response was obtained.
+        ``text_snippet`` — up to 3000 chars of body text (may be empty).
+        ``access_method`` — "HTTP" | "PDF_direto" | "PDF_fallback".
     """
+    import time
     import urllib.error
     import urllib.request
 
     if not url or not url.startswith(("http://", "https://")):
-        return False, ""
+        return False, "", "HTTP"
 
-    try:
-        req = urllib.request.Request(
-            url,
+    # Strategy 0: use S2 API for recognised academic sources
+    api_result = _fetch_via_semantic_scholar_api(url, timeout=timeout)
+    if api_result is not None:
+        return api_result
+
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    def _build_req(target_url: str) -> urllib.request.Request:
+        return urllib.request.Request(
+            target_url,
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; ai-skill-bot/1.0; "
-                    "+https://github.com/leobr/plato)"
-                )
+                "User-Agent": _UA,
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "application/pdf,*/*;q=0.8"
+                ),
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
             },
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(8192)
-            try:
-                text = raw.decode("utf-8", errors="ignore")
-            except Exception:
-                text = ""
-            return True, text[:3000]
-    except urllib.error.HTTPError as exc:
-        logger.debug("HTTP error fetching %s: %s", url, exc)
-        return False, ""
-    except Exception as exc:
-        logger.debug("Failed to fetch %s: %s", url, exc)
-        return False, ""
+
+    raw_bytes: bytes = b""
+    content_type: str = ""
+    max_retries = 2
+
+    for attempt in range(max_retries + 1):
+        try:
+            req = _build_req(url)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content_type = resp.headers.get("Content-Type", "").lower()
+                raw_bytes = resp.read(5 * 1024 * 1024)  # max 5 MB
+            break  # success — exit retry loop
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < max_retries:
+                wait = 5
+                retry_after = exc.headers.get("Retry-After", "")
+                try:
+                    wait = min(int(retry_after), 5)
+                except (ValueError, TypeError):
+                    pass
+                logger.debug(
+                    "429 rate-limit on %s — waiting %ds (attempt %d/%d)",
+                    url, wait, attempt + 1, max_retries,
+                )
+                time.sleep(wait)
+                continue
+            logger.debug("HTTP error fetching %s: %s", url, exc)
+            return False, "", "HTTP"
+        except Exception as exc:
+            logger.debug("Failed to fetch %s: %s", url, exc)
+            return False, "", "HTTP"
+
+    if not raw_bytes:
+        return False, "", "HTTP"
+
+    # ── PDF: direct URL or PDF Content-Type ──────────────────────────────────
+    is_pdf_url = url.lower().split("?")[0].endswith(".pdf")
+    is_pdf_ct = "pdf" in content_type
+    if is_pdf_url or is_pdf_ct:
+        text = _extract_text_from_pdf_bytes(raw_bytes)
+        if text:
+            return True, text, "PDF_direto"
+        # Readable but empty extract (scanned PDF etc.) — still accessible
+        return True, "", "PDF_direto"
+
+    # ── HTML: decode and try PDF link fallback ────────────────────────────────
+    try:
+        html_text = raw_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        html_text = ""
+
+    snippet = html_text[:3000]
+
+    # Try to find and follow PDF/download links embedded in the page
+    pdf_links = _find_pdf_links_in_html(html_text, url)
+    for pdf_url in pdf_links:
+        try:
+            pdf_req = _build_req(pdf_url)
+            with urllib.request.urlopen(pdf_req, timeout=timeout) as pdf_resp:
+                pdf_ct = pdf_resp.headers.get("Content-Type", "").lower()
+                pdf_bytes = pdf_resp.read(5 * 1024 * 1024)
+
+            if "pdf" in pdf_ct or pdf_url.lower().split("?")[0].endswith(".pdf"):
+                extracted = _extract_text_from_pdf_bytes(pdf_bytes)
+                if extracted:
+                    logger.debug("PDF fallback succeeded for %s via %s", url, pdf_url)
+                    return True, extracted, "PDF_fallback"
+        except Exception as exc:
+            logger.debug("PDF fallback failed for %s → %s: %s", url, pdf_url, exc)
+            continue
+
+    return True, snippet, "HTTP"
 
 
 def _literature_review_to_docx(review_doc: dict[str, Any]) -> bytes:
@@ -1428,14 +2398,179 @@ def _literature_review_to_docx(review_doc: dict[str, Any]) -> bytes:
             mark_run.font.bold = True
             mark_run.font.size = Pt(9)
 
+            # Reference number [N] for round-trip lookup
+            num_run = para.add_run(f"[{ref_num}] ")
+            num_run.font.bold = True
+            num_run.font.size = Pt(9)
+
             entry_run = para.add_run(abnt_entry)
             entry_run.font.size = Pt(9)
+
+            # Access method badge (shown when raw PDF/HTTP fallback was used instead of an API)
+            access_method = v_info.get("access_method", "HTTP")
+            _api_methods = {"HTTP", "Semantic_Scholar_API"}
+            if access_method and access_method not in _api_methods:
+                badge_run = para.add_run(f"  [Acesso direto (sem API) — {access_method}]")
+                badge_run.font.size = Pt(8)
+                badge_run.font.italic = True
+                badge_run.font.color.rgb = RGBColor(0, 80, 160)
 
             if note:
                 note_run = para.add_run(f"\n        [{note}]")
                 note_run.font.size = Pt(8)
                 note_run.font.italic = True
                 note_run.font.color.rgb = RGBColor(100, 100, 100)
+
+            # Article summary (up to 200 words)
+            summary = ref.get("summary", "")
+            if summary:
+                summary_para = doc.add_paragraph()
+                summary_run = summary_para.add_run(summary)
+                summary_run.font.size = Pt(8)
+                summary_run.font.italic = True
+                summary_run.font.color.rgb = RGBColor(80, 80, 80)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _research_design_to_docx(design_doc: dict[str, Any]) -> bytes:
+    """Convert a ResearchDesignDoc dict to a formatted .docx file.
+
+    Renders:
+    - A title heading "Design de Pesquisa"
+    - Each section as Heading 2 + body paragraphs (Markdown-lite rendering)
+    - A structured summary block: study type, paradigm, hypotheses (list),
+      variables table (nome | tipo | escala)
+
+    Args:
+        design_doc: A dict matching the ResearchDesignDoc shape.
+
+    Returns:
+        Raw bytes of the generated .docx file, or empty bytes on error.
+    """
+    try:
+        import io
+        from docx import Document
+        from docx.shared import Pt
+    except ImportError:
+        logger.warning("python-docx not available — skipping research design .docx export.")
+        return b""
+
+    doc = Document()
+    doc.add_heading("Design de Pesquisa", level=1)
+
+    # --- Prose sections ---
+    sections = design_doc.get("sections", [])
+    for section in sections:
+        heading = section.get("section_title", "")
+        content = section.get("content", "")
+        if heading:
+            doc.add_heading(heading, level=2)
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("### "):
+                doc.add_heading(stripped[4:], level=3)
+            elif stripped.startswith("## "):
+                doc.add_heading(stripped[3:], level=2)
+            elif stripped.startswith("# "):
+                doc.add_heading(stripped[2:], level=1)
+            elif stripped.startswith("- "):
+                doc.add_paragraph(stripped[2:], style="List Bullet")
+            else:
+                doc.add_paragraph(stripped)
+
+    # --- Structured summary block ---
+    doc.add_heading("Resumo Estruturado", level=2)
+
+    study_type = design_doc.get("study_type", "")
+    paradigm = design_doc.get("research_paradigm", "")
+    stance = design_doc.get("epistemological_stance", "")
+    if study_type or paradigm:
+        meta_para = doc.add_paragraph()
+        meta_para.add_run("Tipo de estudo: ").font.bold = True
+        meta_para.add_run(study_type or "—")
+        meta_para.add_run("   Paradigma: ").font.bold = True
+        meta_para.add_run(paradigm or "—")
+        if stance:
+            meta_para.add_run("   Epistemologia: ").font.bold = True
+            meta_para.add_run(stance)
+
+    hypotheses = design_doc.get("hypotheses", [])
+    if hypotheses:
+        doc.add_heading("Hipóteses", level=3)
+        for h in hypotheses:
+            doc.add_paragraph(h, style="List Bullet")
+
+    research_questions = design_doc.get("research_questions", [])
+    if research_questions:
+        doc.add_heading("Questões de Pesquisa", level=3)
+        for q in research_questions:
+            doc.add_paragraph(q, style="List Bullet")
+
+    metrics = design_doc.get("metrics_and_kpis", [])
+    if metrics:
+        doc.add_heading("Métricas e KPIs", level=3)
+        for m in metrics:
+            doc.add_paragraph(m, style="List Bullet")
+
+    data_sources = design_doc.get("data_sources", [])
+    if data_sources:
+        doc.add_heading("Fontes de Dados", level=3)
+        for ds in data_sources:
+            doc.add_paragraph(ds, style="List Bullet")
+
+    # Variables table
+    variables = design_doc.get("variables", [])
+    if variables:
+        doc.add_heading("Tabela de Variáveis", level=3)
+        tbl = doc.add_table(rows=1, cols=4)
+        tbl.style = "Table Grid"
+        hdr = tbl.rows[0].cells
+        for i, label in enumerate(["Nome", "Tipo", "Escala", "Operacionalização"]):
+            hdr[i].text = label
+            run = hdr[i].paragraphs[0].runs[0]
+            run.font.bold = True
+            run.font.size = Pt(9)
+        for var in variables:
+            row = tbl.add_row().cells
+            row[0].text = var.get("name", "")
+            row[1].text = var.get("variable_type", "")
+            row[2].text = var.get("measurement_scale", "")
+            row[3].text = var.get("operationalization", "")
+            for cell in row:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        run.font.size = Pt(9)
+
+    # Methodology timeline
+    timeline = design_doc.get("methodology_timeline", "")
+    if timeline:
+        doc.add_heading("Cronograma Metodológico", level=3)
+        for line in timeline.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("- "):
+                doc.add_paragraph(stripped[2:], style="List Bullet")
+            else:
+                doc.add_paragraph(stripped)
+
+    reporting = design_doc.get("reporting_standard", "")
+    journal_tier = design_doc.get("target_journal_tier", "")
+    if reporting or journal_tier:
+        meta2 = doc.add_paragraph()
+        if reporting:
+            meta2.add_run("Norma de relato: ").font.bold = True
+            meta2.add_run(reporting)
+        if journal_tier:
+            meta2.add_run("   Alvo de publicação: ").font.bold = True
+            meta2.add_run(journal_tier)
+        for run in meta2.runs:
+            run.font.size = Pt(9)
 
     buf = io.BytesIO()
     doc.save(buf)

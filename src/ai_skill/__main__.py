@@ -2,12 +2,18 @@
 
 Commands:
     workspace begin            Create a new research project workspace (interactive wizard).
-    begin-workspace            Alias for 'workspace begin'.
+    research --begin           Start Research Charter (CP1).
+    research --review          Apply corrections from last CP1 preview and regenerate.
+    research --signoff         Approve last CP1 preview and generate final file.
+    literature --begin         Start Literature Review (CP2).
+    literature --review        Apply corrections from last CP2 preview and regenerate.
+    literature --signoff       Approve last CP2 preview and generate final file.
+    design --begin             Start Research Design (CP3).
+    design --review            Apply corrections from last CP3 preview and regenerate.
+    design --signoff           Approve last CP3 preview and generate final file.
     workspace list             List all existing workspaces.
     workspace files [name]     List files available inside a workspace.
-    research <topic>           Start a new research pipeline for the given topic.
     status [workspace]         Show the current status of an existing workspace.
-    resume [workspace]         Resume a paused research pipeline.
     graph                      Print the Mermaid diagram of the pipeline graph.
     skills list                List all registered skills.
     skills show <name>         Show details for a specific skill.
@@ -141,7 +147,7 @@ def workspace_begin() -> None:
 
     console.print(
         f"\n[dim]Para iniciar a pesquisa neste workspace:[/dim]\n"
-        f'  ai-skill begin-research "{topic}" --workspace "{ws.path}"'
+        f'  ai-skill research --begin --workspace "{ws.path}"'
     )
 
     if typer.confirm("\nIniciar a pesquisa agora?", default=True):
@@ -232,6 +238,110 @@ def workspace_files(
 def begin_workspace_alias() -> None:
     """Criar um novo workspace de pesquisa (alias de 'workspace begin')."""
     workspace_begin()
+
+
+@app.command("research")
+def research_cmd(
+    begin: Annotated[
+        bool,
+        typer.Option("--begin", is_flag=True, help="Iniciar Research Charter (CP1)."),
+    ] = False,
+    review: Annotated[
+        bool,
+        typer.Option("--review", is_flag=True, help="Aplicar correções ao último preview do CP1."),
+    ] = False,
+    signoff: Annotated[
+        bool,
+        typer.Option("--signoff", is_flag=True, help="Aprovar preview e gerar arquivo final sem marcações."),
+    ] = False,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Diretório do workspace."),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option("--model", "-m", help="Claude model ID."),
+    ] = "",
+) -> None:
+    """Gerenciar o Research Charter (Checkpoint 1).
+
+    Use uma das flags para selecionar a ação:\n
+      --begin     Iniciar uma nova pesquisa\n
+      --review    Revisar o último preview (aplicar correções do Word)\n
+      --signoff   Aprovar o preview atual e gerar arquivo final
+    """
+    flags = [begin, review, signoff]
+    if sum(flags) > 1:
+        console.print("[red]Use apenas uma flag por vez: --begin, --review ou --signoff.[/red]")
+        raise typer.Exit(1)
+    if not any(flags):
+        console.print(
+            "\n[bold]ai-skill research[/bold]  —  Research Charter (CP1)\n\n"
+            "  [cyan]--begin[/cyan]     Iniciar uma nova pesquisa\n"
+            "  [cyan]--review[/cyan]    Revisar o último preview (aplicar correções do Word)\n"
+            "  [cyan]--signoff[/cyan]   Aprovar o preview atual e gerar arquivo final\n"
+        )
+        raise typer.Exit(0)
+
+    if begin:
+        begin_research(topic="", workspace=workspace, model=model)
+    elif review:
+        resume(workspace=workspace, correct=True)
+    elif signoff:
+        ws_path = _resolve_workspace_path(workspace, state_subdir=True)
+        if ws_path is None:
+            raise typer.Exit(1)
+        _signoff_checkpoint(ws_path, 1)
+
+
+@app.command("literature")
+def literature_cmd(
+    begin: Annotated[
+        bool,
+        typer.Option("--begin", is_flag=True, help="Iniciar Revisão Bibliográfica (CP2)."),
+    ] = False,
+    review: Annotated[
+        bool,
+        typer.Option("--review", is_flag=True, help="Aplicar correções ao último preview do CP2."),
+    ] = False,
+    signoff: Annotated[
+        bool,
+        typer.Option("--signoff", is_flag=True, help="Aprovar preview e gerar arquivo final sem marcações."),
+    ] = False,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Diretório do workspace."),
+    ] = None,
+) -> None:
+    """Gerenciar a Revisão Bibliográfica (Checkpoint 2).
+
+    Use uma das flags para selecionar a ação:\n
+      --begin     Iniciar a pesquisa bibliográfica\n
+      --review    Revisar o último preview (aplicar correções do Word)\n
+      --signoff   Aprovar o preview atual e gerar arquivo final
+    """
+    flags = [begin, review, signoff]
+    if sum(flags) > 1:
+        console.print("[red]Use apenas uma flag por vez: --begin, --review ou --signoff.[/red]")
+        raise typer.Exit(1)
+    if not any(flags):
+        console.print(
+            "\n[bold]ai-skill literature[/bold]  —  Revisão Bibliográfica (CP2)\n\n"
+            "  [cyan]--begin[/cyan]     Iniciar a pesquisa bibliográfica\n"
+            "  [cyan]--review[/cyan]    Revisar o último preview (aplicar correções do Word)\n"
+            "  [cyan]--signoff[/cyan]   Aprovar o preview atual e gerar arquivo final\n"
+        )
+        raise typer.Exit(0)
+
+    if begin:
+        begin_literature(workspace=workspace)
+    elif review:
+        resume(workspace=workspace, correct=True)
+    elif signoff:
+        ws_path = _resolve_workspace_path(workspace, state_subdir=True)
+        if ws_path is None:
+            raise typer.Exit(1)
+        _signoff_checkpoint(ws_path, 2)
 
 
 @app.command("begin-research")
@@ -325,8 +435,8 @@ def begin_research(
         return
     except KeyboardInterrupt:
         ws.save_state(current_state)
-        console.print("\n[yellow]Research paused. Resume with:[/yellow]")
-        console.print(f"  ai-skill resume --workspace {state_path}")
+        console.print("\n[yellow]Pesquisa pausada. Retome com:[/yellow]")
+        console.print(f"  ai-skill research --review --workspace \"{state_path}\"")
         sys.exit(0)
 
 
@@ -384,7 +494,7 @@ def resume(
     """
     _configure_logging(os.environ.get("AI_SKILL_LOG_LEVEL", "WARNING"))
 
-    from ai_skill.core.graph import build_cp1_graph, build_cp2_graph
+    from ai_skill.core.graph import build_cp1_graph, build_cp2_graph, build_cp3_graph
     from ai_skill.core.workspace import ResearchWorkspace
 
     ws_path = _resolve_workspace_path(workspace, state_subdir=True)
@@ -410,7 +520,7 @@ def resume(
         if state is None:
             console.print(f"[red]No state found in:[/red] {workspace}")
             console.print(
-                f"[dim]Re-run:[/dim]  ai-skill begin-research \"<tópico>\" --workspace \"{project_path}\""
+                f"[dim]Re-run:[/dim]  ai-skill research --begin --workspace \"{project_path}\""
             )
             raise typer.Exit(1)
 
@@ -430,9 +540,15 @@ def resume(
             state["literature_approved"] = True
             ws.save_state(state)
             _finalize_checkpoint(workspace, 2)
+            _handle_cp3_start(state, workspace)
+        elif active_cp == 3 and not state.get("design_approved"):
+            # CP3 approval
+            state["design_approved"] = True
+            ws.save_state(state)
+            _finalize_checkpoint(workspace, 3)
             console.print(
-                "\n[bold green]✓ Checkpoint 2 aprovado![/bold green] "
-                "Revisão bibliográfica finalizada."
+                "\n[bold green]✓ Checkpoint 3 aprovado![/bold green] "
+                "Research Design finalizado."
             )
         else:
             console.print(
@@ -471,7 +587,7 @@ def resume(
         if final_path.exists():
             last_preview = final_path
         else:
-            cp_names = {1: "Checkpoint 1 (Research Charter)", 2: "Checkpoint 2 (Literature Review)"}
+            cp_names = {1: "Checkpoint 1 (Research Charter)", 2: "Checkpoint 2 (Literature Review)", 3: "Checkpoint 3 (Research Design)"}
             console.print(
                 f"[red]Nenhum preview encontrado para {cp_names.get(active_cp, f'Checkpoint {active_cp}')}. "
                 "Execute a pesquisa primeiro.[/red]"
@@ -493,7 +609,12 @@ def resume(
     state["user_feedback"] = _format_corrections_for_llm(corrections)
 
     # Select graph based on active checkpoint
-    graph = build_cp1_graph() if active_cp == 1 else build_cp2_graph()
+    if active_cp == 1:
+        graph = build_cp1_graph()
+    elif active_cp == 3:
+        graph = build_cp3_graph()
+    else:
+        graph = build_cp2_graph()
     console.print(f"[bold]Aplicando correções — CP{active_cp}:[/bold] {state.get('objective', {}).get('topic', '?')}")
     current_state: dict = dict(state)
 
@@ -514,8 +635,8 @@ def resume(
         return
     except KeyboardInterrupt:
         ws.save_state(current_state)
-        console.print("\n[yellow]Research paused. Resume with:[/yellow]")
-        console.print(f"  ai-skill resume --workspace \"{workspace}\"")
+        console.print("\n[yellow]Pesquisa pausada. Retome com:[/yellow]")
+        console.print(f"  ai-skill research --review --workspace \"{workspace}\"")
         sys.exit(0)
 
 
@@ -567,12 +688,15 @@ def begin_literature(
             f"  O arquivo [bold]{final_cp1.name}[/bold] não foi encontrado em:\n"
             f"  {project_path}\n"
             f"\n[dim]Complete o Checkpoint 1 antes de iniciar a Revisão Bibliográfica:[/dim]\n"
-            f"  ai-skill begin-research \"<tópico>\" --workspace \"{project_path}\"\n"
-            f"  ai-skill resume --workspace \"{state_path}\""
+            f"  ai-skill research --begin --workspace \"{project_path}\"\n"
+            f"  ai-skill research --signoff --workspace \"{state_path}\""
         )
         raise typer.Exit(1)
 
     console.print(f"[green]✓[/green] Checkpoint 1 aprovado: [dim]{final_cp1.name}[/dim]")
+
+    # --- Warn if CP2 work already exists ---
+    _warn_overwrite(project_path, checkpoints=[2])
 
     # --- Load or reconstruct state ---
     from ai_skill.core.graph import build_cp2_graph
@@ -587,16 +711,32 @@ def begin_literature(
             console.print(
                 "[red]Não foi possível carregar o estado do projeto.[/red]\n"
                 "[dim]Tente re-rodar:[/dim]\n"
-                f"  ai-skill begin-research \"<tópico>\" --workspace \"{project_path}\""
+                f"  ai-skill research --begin --workspace \"{project_path}\""
             )
             raise typer.Exit(1)
 
     # Guarantee charter is approved so the graph passes through the gate
     state["charter_approved"] = True
     state["user_feedback"] = None
+    state["attempt"] = 0
 
     # Inject CP1 final.docx text so compile_literature can build on it
     state["charter_document_text"] = _read_docx_text(final_cp1)
+
+    # Set the correct stage so CP2 node routing works (CP1 left it as RESEARCH_CHARTER)
+    from ai_skill.core.pipeline_stages import PipelineStage as _PS
+    state["stage"] = _PS.LITERATURE_REVIEW
+
+    # Build the CP2 handoff — the ONLY view of the research objective that CP2
+    # nodes receive.  success_metrics and all other CP1-only fields are excluded
+    # so the planner and evaluator cannot design steps toward global deliverables
+    # (framework development, article submission, etc.) during bibliographic search.
+    _full_obj = state.get("objective") or {}
+    state["cp2_context"] = {
+        "topic":             _full_obj.get("topic") or "",
+        "goals":             list(_full_obj.get("goals") or []),
+        "scope_constraints": list(_full_obj.get("scope_constraints") or []),
+    }
 
     topic = (state.get("objective") or {}).get("topic", "")
     console.print(
@@ -631,7 +771,7 @@ def begin_literature(
     except KeyboardInterrupt:
         ws.save_state(current_state)
         console.print("\n[yellow]Pesquisa pausada. Retome com:[/yellow]")
-        console.print(f"  ai-skill resume --workspace \"{state_path}\"")
+        console.print(f"  ai-skill literature --review --workspace \"{state_path}\"")
         sys.exit(0)
 
 
@@ -1130,7 +1270,8 @@ def _extract_docx_corrections(path: Path) -> dict | None:
             if text.strip():
                 deletions.append({"text": text.strip(), "context": para_text[:120]})
 
-    # Comments from word/comments.xml
+    # Comments from word/comments.xml — also capture annotated anchor text
+    # so the LLM knows which passage each comment targets.
     comments: list[dict] = []
     try:
         with zipfile.ZipFile(str(path)) as z:
@@ -1139,10 +1280,37 @@ def _extract_docx_corrections(path: Path) -> dict | None:
                 root = etree.fromstring(z.read("word/comments.xml"))
                 for comment_elem in root.findall(f"{{{W}}}comment"):
                     author = comment_elem.get(f"{{{W}}}author", "Usuário")
+                    comment_id = comment_elem.get(f"{{{W}}}id", "")
                     t_elems = comment_elem.findall(f".//{{{W}}}t")
                     text = "".join(t.text or "" for t in t_elems).strip()
-                    if text:
-                        comments.append({"author": author, "text": text})
+                    if not text:
+                        continue
+                    # Find the anchor text in document.xml tied to this comment id
+                    anchor = ""
+                    if comment_id and "word/document.xml" in z.namelist():
+                        try:
+                            doc_root = etree.fromstring(z.read("word/document.xml"))
+                            # Find commentRangeStart with matching id, then collect
+                            # text until the paired commentRangeEnd
+                            start_tag = f"{{{W}}}commentRangeStart"
+                            end_tag = f"{{{W}}}commentRangeEnd"
+                            collecting = False
+                            anchor_parts: list[str] = []
+                            for elem in doc_root.iter():
+                                if elem.tag == start_tag and elem.get(f"{{{W}}}id") == comment_id:
+                                    collecting = True
+                                    continue
+                                if elem.tag == end_tag and elem.get(f"{{{W}}}id") == comment_id:
+                                    break
+                                if collecting and elem.tag == f"{{{W}}}t" and elem.text:
+                                    anchor_parts.append(elem.text)
+                            anchor = "".join(anchor_parts).strip()[:200]
+                        except Exception:
+                            pass
+                    entry: dict = {"author": author, "text": text}
+                    if anchor:
+                        entry["anchor"] = anchor
+                    comments.append(entry)
     except Exception:
         pass
 
@@ -1171,7 +1339,8 @@ def _format_corrections_for_llm(corrections: dict) -> str:
     if corrections.get("comments"):
         parts.append("## Comentários do pesquisador (instruções a implementar):")
         for c in corrections["comments"]:
-            parts.append(f'- [{c["author"]}]: {c["text"]}')
+            anchor_info = f'  (sobre: "{c["anchor"]}")' if c.get("anchor") else ""
+            parts.append(f'- [{c["author"]}]: {c["text"]}{anchor_info}')
 
     if corrections.get("insertions"):
         parts.append("\n## Trechos inseridos pelo pesquisador (incorporar):")
@@ -1329,6 +1498,349 @@ def _parse_objective_from_docx(path: Path) -> dict | None:
     return obj if obj.get("goals") else None
 
 
+def _strip_docx_markup(source: Path, dest: Path) -> bool:
+    """Copy source to dest with track changes accepted and all markup removed.
+
+    Accepts all insertions (keeps text), removes all deletions, clears
+    highlight formatting and comment references.
+
+    Args:
+        source: Path to the source .docx file.
+        dest: Destination path for the cleaned .docx.
+
+    Returns:
+        True if markup was stripped successfully, False if a plain copy was used.
+    """
+    try:
+        import zipfile
+        from lxml import etree as _etree  # type: ignore[import-untyped]
+
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+        with zipfile.ZipFile(source, "r") as z:
+            contents: dict[str, bytes] = {n: z.read(n) for n in z.namelist()}
+
+        if "word/document.xml" in contents:
+            root = _etree.fromstring(contents["word/document.xml"])
+
+            # Accept insertions: unwrap w:ins (keep child elements)
+            for ins in list(root.iter(f"{{{W}}}ins")):
+                parent = ins.getparent()
+                if parent is None:
+                    continue
+                idx = list(parent).index(ins)
+                for child in list(ins):
+                    ins.remove(child)
+                    parent.insert(idx, child)
+                    idx += 1
+                parent.remove(ins)
+
+            # Remove deletions entirely
+            for del_elem in list(root.iter(f"{{{W}}}del")):
+                parent = del_elem.getparent()
+                if parent is not None:
+                    parent.remove(del_elem)
+
+            # Remove highlight formatting
+            for hl in list(root.iter(f"{{{W}}}highlight")):
+                parent = hl.getparent()
+                if parent is not None:
+                    parent.remove(hl)
+
+            # Remove comment anchor elements
+            for tag in (
+                f"{{{W}}}commentReference",
+                f"{{{W}}}commentRangeStart",
+                f"{{{W}}}commentRangeEnd",
+            ):
+                for elem in list(root.iter(tag)):
+                    parent = elem.getparent()
+                    if parent is not None:
+                        parent.remove(elem)
+
+            contents["word/document.xml"] = _etree.tostring(
+                root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+
+        # Remove comment files
+        contents = {k: v for k, v in contents.items() if "comments" not in k.lower()}
+
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, data in contents.items():
+                z.writestr(name, data)
+
+        return True
+    except Exception:
+        import shutil as _shutil
+        _shutil.copy2(source, dest)
+        return False
+
+
+def _slugify_word(word: str) -> str:
+    """Return a lowercase ASCII-safe slug for one word (used in filenames)."""
+    import re
+    import unicodedata
+    norm = unicodedata.normalize("NFKD", word).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", norm.lower())
+
+
+def _make_ref_filename(ref_num: int, ref: dict) -> str:
+    """Build a short filename: ``NN_firstauthor_kw1_kw2_kw3`` (no extension)."""
+    authors: list = ref.get("authors") or []
+    title: str = ref.get("title") or ""
+
+    first_author = _slugify_word(
+        (authors[0].split(",")[0].split()[-1] if authors else "unknown")
+    ) or "unknown"
+
+    stop = {"the", "a", "an", "of", "in", "on", "at", "for", "and", "with",
+            "to", "de", "da", "do", "em", "um", "uma", "para", "com", "por"}
+    keywords = [
+        _slugify_word(w)
+        for w in title.split()
+        if len(w) > 3 and _slugify_word(w) not in stop
+    ][:3]
+
+    base = f"{ref_num:02d}_{first_author}"
+    if keywords:
+        base += "_" + "_".join(keywords)
+    return base
+
+
+def _text_to_pdf_bytes(title: str, content: str) -> bytes:
+    """Create a minimal PDF from plain/markdown text using PyMuPDF.
+
+    Returns empty bytes if PyMuPDF is unavailable or the conversion fails.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return b""
+    try:
+        doc = fitz.open()
+        page = doc.new_page()
+        rect = fitz.Rect(50, 60, 545, 780)
+        text_block = f"{title}\n{'─' * 60}\n\n{content}"
+        page.insert_textbox(rect, text_block, fontsize=10, fontname="helv")
+        return doc.tobytes()
+    except Exception as exc:
+        logger.debug("_text_to_pdf_bytes failed: %s", exc)
+        return b""
+
+
+def _download_references_to_attachments(
+    review_doc: dict,
+    pw: "ProjectWorkspace",
+) -> list[int]:
+    """Download all referenced sources to the attachments folder.
+
+    Strategy per reference:
+    1. Try Semantic Scholar openAccessPdf (API).
+    2. Try direct HTTP PDF download.
+    3. Fall back to saving the abstract/summary as a plain PDF.
+
+    Files are named ``NN_firstauthor_kw1_kw2_kw3.pdf``.
+
+    Args:
+        review_doc: The LiteratureReviewDoc dict with ``references``.
+        pw: ProjectWorkspace whose ``attachments_path`` receives the files.
+
+    Returns:
+        List of reference numbers that could NOT be saved.
+    """
+    import os
+    import urllib.error
+    import urllib.request
+
+    from ai_skill.core.nodes import (  # reuse helpers defined in nodes.py
+        _fetch_via_semantic_scholar_api,
+        _extract_text_from_pdf_bytes,
+    )
+
+    references: list[dict] = review_doc.get("references", [])
+    attachments_dir = pw.attachments_path
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
+    failed: list[int] = []
+
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    for ref in references:
+        ref_num: int = ref.get("reference_number", 0)
+        url: str = ref.get("url", "")
+        summary: str = ref.get("summary") or ref.get("title") or ""
+        base_name = _make_ref_filename(ref_num, ref)
+        out_path = attachments_dir / f"{base_name}.pdf"
+
+        if out_path.exists():
+            console.print(f"  [dim][{ref_num:02d}] já existe — pulando[/dim]")
+            continue
+
+        pdf_bytes: bytes = b""
+
+        # --- Strategy 1: Semantic Scholar openAccessPdf ---
+        try:
+            from ai_skill.core.nodes import _S2_PAPER_API, _S2_PAPER_FIELDS  # type: ignore[attr-defined]
+            import re as _re, json as _json
+            paper_id: str | None = None
+            m = _re.search(r"semanticscholar\.org/paper/([A-Za-z0-9]+)", url)
+            if m:
+                paper_id = m.group(1)
+            if paper_id is None:
+                m2 = _re.search(r"(?:doi\.org/|/doi/)([^/\s]+/[^/\s]+)", url)
+                if m2:
+                    paper_id = f"DOI:{m2.group(1)}"
+            if paper_id is None:
+                m3 = _re.search(r"arxiv\.org/(?:abs|pdf)/([^\s?/]+)", url)
+                if m3:
+                    paper_id = f"arXiv:{m3.group(1).split('v')[0]}"
+
+            if paper_id:
+                api_url = f"{_S2_PAPER_API}/{paper_id}?fields={_S2_PAPER_FIELDS}"
+                hdrs: dict[str, str] = {"Accept": "application/json"}
+                if api_key:
+                    hdrs["x-api-key"] = api_key
+                req = urllib.request.Request(api_url, headers=hdrs)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = _json.loads(resp.read().decode())
+                oa_pdf = (data.get("openAccessPdf") or {}).get("url", "")
+                if oa_pdf:
+                    pdf_req = urllib.request.Request(oa_pdf, headers={"User-Agent": _UA})
+                    with urllib.request.urlopen(pdf_req, timeout=30) as pdf_resp:
+                        pdf_bytes = pdf_resp.read(10 * 1024 * 1024)
+        except Exception as exc:
+            logger.debug("[%d] S2 openAccessPdf failed: %s", ref_num, exc)
+
+        # --- Strategy 2: Direct PDF from URL ---
+        if not pdf_bytes:
+            try:
+                is_pdf = url.lower().split("?")[0].endswith(".pdf")
+                if is_pdf:
+                    pdf_req = urllib.request.Request(url, headers={"User-Agent": _UA})
+                    with urllib.request.urlopen(pdf_req, timeout=30) as pdf_resp:
+                        ct = pdf_resp.headers.get("Content-Type", "")
+                        raw = pdf_resp.read(10 * 1024 * 1024)
+                        if "pdf" in ct or is_pdf:
+                            pdf_bytes = raw
+            except Exception as exc:
+                logger.debug("[%d] Direct PDF download failed: %s", ref_num, exc)
+
+        # --- Strategy 3: Save abstract/summary as PDF ---
+        if not pdf_bytes:
+            content = (
+                f"Referência [{ref_num}]\n"
+                f"Título: {ref.get('title', '')}\n"
+                f"Autores: {', '.join(ref.get('authors') or [])}\n"
+                f"Ano: {ref.get('year', '')}\n"
+                f"URL: {url}\n\n"
+                f"Resumo:\n{summary}"
+            )
+            pdf_bytes = _text_to_pdf_bytes(
+                title=f"[{ref_num}] {ref.get('title', '')}",
+                content=content,
+            )
+            if pdf_bytes:
+                logger.debug("[%d] Saved as abstract PDF.", ref_num)
+
+        if pdf_bytes:
+            out_path.write_bytes(pdf_bytes)
+            console.print(f"  [green]✓[/green] [{ref_num:02d}] {out_path.name}")
+        else:
+            failed.append(ref_num)
+            console.print(f"  [red]✗[/red] [{ref_num:02d}] não foi possível salvar")
+
+    return failed
+
+
+def _signoff_checkpoint(workspace_path: Path, checkpoint: int) -> None:
+    """Approve the last preview for a checkpoint and save as final (markup stripped).
+
+    Args:
+        workspace_path: Path to the ResearchWorkspace (.state/) directory.
+        checkpoint: Checkpoint number to finalize (1 or 2).
+    """
+    from ai_skill.core.workspace import ResearchWorkspace
+
+    ws = ResearchWorkspace(workspace_path)
+    state = ws.load_state()
+
+    if state is None:
+        console.print(f"[red]Nenhum estado encontrado em:[/red] {workspace_path}")
+        raise typer.Exit(1)
+
+    project_path = workspace_path.parent
+    if not (project_path / "workspace.yaml").exists():
+        console.print("[red]Workspace não reconhecido.[/red]")
+        raise typer.Exit(1)
+
+    from ai_skill.core.project_workspace import ProjectWorkspace
+    pw = ProjectWorkspace.from_path(project_path)
+
+    last_preview = pw.get_last_preview(checkpoint)
+    if last_preview is None:
+        console.print(
+            f"[red]Nenhum preview encontrado para CP{checkpoint}.[/red]\n"
+            "[dim]Execute a pesquisa primeiro.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    final_path = pw.checkpoint_final_path(checkpoint)
+    if final_path.exists():
+        console.print(
+            f"\n[bold yellow]⚠ Já existe um arquivo final:[/bold yellow]\n"
+            f"  {final_path.name}"
+        )
+        if not typer.confirm("Deseja sobrescrever?", default=True):
+            console.print("[dim]Arquivo final mantido sem alteração.[/dim]")
+            raise typer.Exit(0)
+
+    console.print(f"[dim]Gerando arquivo final a partir de:[/dim] {last_preview.name}")
+    stripped = _strip_docx_markup(last_preview, final_path)
+    if not stripped:
+        console.print("[yellow]⚠ Não foi possível remover marcações — arquivo copiado como está.[/yellow]")
+
+    pw.update_metadata({"current_checkpoint": checkpoint, "status": f"checkpoint_{checkpoint}_final"})
+
+    if checkpoint == 1:
+        state["charter_approved"] = True
+        ws.save_state(state)
+        console.print(f"\n[bold green]✓ Checkpoint 1 aprovado[/bold green] → [bold]{final_path.name}[/bold]")
+        _handle_cp2_start(state, workspace_path)
+    elif checkpoint == 2:
+        state["literature_approved"] = True
+        ws.save_state(state)
+        console.print(f"\n[bold green]✓ Checkpoint 2 aprovado[/bold green] → [bold]{final_path.name}[/bold]")
+        # Download all referenced sources to attachments/
+        review_doc = state.get("literature_review_doc") or {}
+        refs = review_doc.get("references", [])
+        if refs:
+            console.print(
+                f"\n[bold]Baixando {len(refs)} fonte(s) referenciada(s) para attachments/[/bold]"
+            )
+            failed_refs = _download_references_to_attachments(review_doc, pw)
+            if failed_refs:
+                console.print(
+                    f"\n[yellow]⚠ {len(failed_refs)} fonte(s) não puderam ser salvas "
+                    f"— verifique manualmente:[/yellow]"
+                )
+                for rn in sorted(failed_refs):
+                    console.print(f"  [{rn}]")
+        _handle_cp3_start(state, workspace_path)
+    elif checkpoint == 3:
+        state["design_approved"] = True
+        ws.save_state(state)
+        console.print(f"\n[bold green]✓ Checkpoint 3 aprovado[/bold green] → [bold]{final_path.name}[/bold]")
+        console.print("[dim]Research Design finalizado. O próximo passo será CP4 (coleta de dados).[/dim]")
+    else:
+        ws.save_state(state)
+        console.print(f"\n[bold green]✓ Checkpoint {checkpoint} aprovado[/bold green] → [bold]{final_path.name}[/bold]")
+
+
 _NODE_LABELS: dict[str, str] = {
     # CP1 — Research Charter
     "initiate":         "Iniciando workspace",
@@ -1344,7 +1856,14 @@ _NODE_LABELS: dict[str, str] = {
     "verify_literature":   "Verificando fontes e referências",
     "deliver_literature":  "Gerando documento preview",
     "review_literature":   "Processando revisão da literatura",
+    "recheck_sources":     "Rechecando fontes via API",
     "refine_literature":   "Refinando com base nas correções",
+    # CP3 — Research Design
+    "cp3_router":       "Iniciando Research Design",
+    "compile_design":   "Compilando Research Design",
+    "deliver_design":   "Gerando documento preview",
+    "review_design":    "Processando revisão do design",
+    "refine_design":    "Refinando com base nas correções",
 }
 
 
@@ -1471,7 +1990,7 @@ def _handle_support_request(state: dict, workspace: Path) -> None:  # type: igno
     ResearchWorkspace(workspace).save_state(state)
 
     console.print("\n[green]Orientação registrada.[/green] Retome a pesquisa com:")
-    console.print(f"  ai-skill begin-literature --workspace \"{workspace.parent}\"")
+    console.print(f"  ai-skill literature --begin --workspace \"{workspace.parent}\"")
 
 
 def _handle_checkpoint(
@@ -1502,8 +2021,12 @@ def _handle_checkpoint(
         return
 
     active_cp = int(state.get("active_checkpoint", 1))
-    if active_cp == 2:
+    if active_cp == 3:
+        _handle_checkpoint_3(state, workspace)
+    elif active_cp == 2:
         _handle_checkpoint_2(state, workspace)
+    elif state.get("literature_approved"):
+        _handle_cp3_start(state, workspace)
     elif state.get("charter_approved"):
         _handle_cp2_start(state, workspace)
     else:
@@ -1543,7 +2066,7 @@ def _handle_checkpoint_1(state: dict, workspace: Path) -> None:  # type: ignore[
 
     console.print(
         f"\n[bold]Para aprovar[/bold] (sem alterações):\n"
-        f"  ai-skill resume --workspace \"{workspace}\"\n"
+        f"  ai-skill research --signoff --workspace \"{workspace}\"\n"
         f"\n[bold]Para solicitar correções[/bold]:\n"
         f"  1. Abra o preview acima no Word\n"
         f"  2. Use uma das formas para indicar correções:\n"
@@ -1551,7 +2074,7 @@ def _handle_checkpoint_1(state: dict, workspace: Path) -> None:  # type: ignore[
         f"       [dim]• Marcas de revisão[/dim] → a IA incorpora as suas alterações\n"
         f"       [dim]• Realce amarelo[/dim]    → a IA regera o trecho completamente\n"
         f"  3. Salve o arquivo\n"
-        f"  4. ai-skill resume --workspace \"{workspace}\" --correct"
+        f"  4. ai-skill research --review --workspace \"{workspace}\""
     )
 
 
@@ -1581,7 +2104,7 @@ def _handle_cp2_start(state: dict, workspace: Path) -> None:  # type: ignore[typ
 
     console.print(
         f"\n[bold]Para iniciar a Revisão Bibliográfica (Checkpoint 2):[/bold]\n"
-        f"  ai-skill resume --workspace \"{workspace}\"\n"
+        f"  ai-skill literature --begin --workspace \"{workspace.parent}\"\n"
         f"\n[dim]O agente irá pesquisar, compilar e verificar as referências "
         f"bibliográficas automaticamente.[/dim]"
     )
@@ -1622,16 +2145,19 @@ def _handle_checkpoint_2(state: dict, workspace: Path) -> None:  # type: ignore[
         )
 
     if docx_path:
-        console.print("\n[green]✓ Documento salvo em:[/green]")
-        console.print(f"  [bold]{docx_path}[/bold]")
+        console.print(f"\n[bold green]✓ Revisão Bibliográfica concluída[/bold green]")
+        console.print(f"  [dim]Preview salvo em:[/dim] [bold]{docx_path}[/bold]")
         console.print(
-            "\n[dim]Abra o arquivo, revise os textos e as referências bibliográficas.[/dim]\n"
-            "[dim]Marcações coloridas indicam o status de verificação de cada fonte.[/dim]"
+            "\n[dim]Abra o arquivo, avalie os textos e as referências bibliográficas.\n"
+            "Use comentários, marcas de revisão ou realce amarelo para indicar correções.[/dim]"
         )
+    else:
+        console.print("\n[bold yellow]⚠ Revisão Bibliográfica concluída sem preview[/bold yellow]")
+        console.print("[dim]Reexecute com:[/dim]  ai-skill literature --begin")
 
     console.print(
         f"\n[bold]Para aprovar[/bold] (sem alterações):\n"
-        f"  ai-skill resume --workspace \"{workspace}\"\n"
+        f"  ai-skill literature --signoff --workspace \"{workspace}\"\n"
         f"\n[bold]Para solicitar correções[/bold]:\n"
         f"  1. Abra o preview acima no Word\n"
         f"  2. Use uma das formas para indicar correções:\n"
@@ -1639,8 +2165,445 @@ def _handle_checkpoint_2(state: dict, workspace: Path) -> None:  # type: ignore[
         f"       [dim]• Marcas de revisão[/dim] → a IA incorpora as suas alterações\n"
         f"       [dim]• Realce amarelo[/dim]    → a IA regera o trecho completamente\n"
         f"  3. Salve o arquivo\n"
-        f"  4. ai-skill resume --workspace \"{workspace}\" --correct"
+        f"  4. ai-skill literature --review --workspace \"{workspace}\""
     )
+
+
+def _handle_cp3_start(state: dict, workspace: Path) -> None:  # type: ignore[type-arg]
+    """Display the CP2 approval confirmation and CP3 start instructions.
+
+    Shown after the user approves the Literature Review (CP2).
+
+    Args:
+        state: Accumulated research state.
+        workspace: Path to the ResearchWorkspace (.state/) directory.
+    """
+    topic = (state.get("objective") or {}).get("topic", "")
+    title = "✓ Checkpoint 2 — Revisão Bibliográfica aprovada"
+    if topic:
+        title += f": [italic]{topic}[/italic]"
+    console.print(f"\n[bold green]{title}[/bold green]")
+
+    project_path = workspace.parent
+    if (project_path / "workspace.yaml").exists():
+        from ai_skill.core.project_workspace import ProjectWorkspace
+        pw = ProjectWorkspace.from_path(project_path)
+        final = pw.checkpoint_final_path(2)
+        if final.exists():
+            console.print(f"  [dim]Arquivo final:[/dim] {final.name}")
+
+    console.print(
+        f"\n[bold]Para iniciar o Research Design (Checkpoint 3):[/bold]\n"
+        f"  ai-skill design --begin --workspace \"{project_path}\"\n"
+        f"\n[dim]O agente irá identificar o método de pesquisa, formular hipóteses,\n"
+        f"operacionalizar variáveis e definir os instrumentos de coleta automaticamente.[/dim]"
+    )
+
+
+def _handle_checkpoint_3(state: dict, workspace: Path) -> None:  # type: ignore[type-arg]
+    """Display Checkpoint 3 (Research Design) summary and resume instructions.
+
+    Args:
+        state: Accumulated research state.
+        workspace: Path to the ResearchWorkspace (.state/) directory.
+    """
+    console.print("\n[bold yellow]━━ CHECKPOINT 3 — Research Design ━━[/bold yellow]")
+
+    docx_path = state.get("checkpoint_label", "")
+    design_doc = state.get("research_design_doc") or {}
+
+    study_type = design_doc.get("study_type", "")
+    paradigm = design_doc.get("research_paradigm", "")
+    stance = design_doc.get("epistemological_stance", "")
+    hypotheses = design_doc.get("hypotheses") or []
+    variables = design_doc.get("variables") or []
+    instruments = design_doc.get("instruments") or []
+    reporting_std = design_doc.get("reporting_standard", "")
+    journal_tier = design_doc.get("target_journal_tier", "")
+
+    if study_type:
+        console.print(f"\n[bold]Classificação:[/bold]")
+        console.print(f"  [cyan]Tipo de estudo:[/cyan] {study_type}")
+        if paradigm:
+            console.print(f"  [cyan]Paradigma:[/cyan] {paradigm}")
+        if stance:
+            console.print(f"  [cyan]Stance epistemológica:[/cyan] {stance}")
+
+    if hypotheses:
+        console.print(f"\n[bold]Hipóteses ({len(hypotheses)}):[/bold]")
+        for h in hypotheses[:3]:
+            console.print(f"  [cyan]•[/cyan] {h[:120]}{'…' if len(h) > 120 else ''}")
+        if len(hypotheses) > 3:
+            console.print(f"  [dim]... e mais {len(hypotheses) - 3} hipóteses[/dim]")
+
+    if variables:
+        console.print(f"\n[bold]Variáveis ({len(variables)}):[/bold]")
+        for v in variables[:5]:
+            name = v.get("name", "") if isinstance(v, dict) else str(v)
+            vtype = v.get("type", "") if isinstance(v, dict) else ""
+            console.print(f"  [cyan]•[/cyan] {name}" + (f" [{vtype}]" if vtype else ""))
+        if len(variables) > 5:
+            console.print(f"  [dim]... e mais {len(variables) - 5} variáveis[/dim]")
+
+    if instruments:
+        console.print(f"\n[bold]Instrumentos de coleta ({len(instruments)}):[/bold]")
+        for inst in instruments[:3]:
+            console.print(f"  [cyan]•[/cyan] {inst[:100]}{'…' if len(inst) > 100 else ''}")
+
+    if reporting_std or journal_tier:
+        console.print(f"\n[bold]Publicação:[/bold]")
+        if reporting_std:
+            console.print(f"  [cyan]Padrão de reporte:[/cyan] {reporting_std}")
+        if journal_tier:
+            console.print(f"  [cyan]Tier SJR alvo:[/cyan] {journal_tier}")
+
+    if docx_path:
+        console.print(f"\n[bold green]✓ Research Design concluído[/bold green]")
+        console.print(f"  [dim]Preview salvo em:[/dim] [bold]{docx_path}[/bold]")
+        console.print(
+            "\n[dim]Abra o arquivo, avalie o design metodológico.\n"
+            "Use comentários, marcas de revisão ou realce amarelo para indicar correções.[/dim]"
+        )
+    else:
+        console.print("\n[bold yellow]⚠ Research Design concluído sem preview[/bold yellow]")
+        console.print("[dim]Reexecute com:[/dim]  ai-skill design --begin")
+
+    console.print(
+        f"\n[bold]Para aprovar[/bold] (sem alterações):\n"
+        f"  ai-skill design --signoff --workspace \"{workspace}\"\n"
+        f"\n[bold]Para solicitar correções[/bold]:\n"
+        f"  1. Abra o preview acima no Word\n"
+        f"  2. Use uma das formas para indicar correções:\n"
+        f"       [dim]• Comentários[/dim]       → aciona a IA para implementar a instrução\n"
+        f"       [dim]• Marcas de revisão[/dim] → a IA incorpora as suas alterações\n"
+        f"       [dim]• Realce amarelo[/dim]    → a IA regera o trecho completamente\n"
+        f"  3. Salve o arquivo\n"
+        f"  4. ai-skill design --review --workspace \"{workspace}\""
+    )
+
+
+@app.command("design")
+def design_cmd(
+    begin: Annotated[
+        bool,
+        typer.Option("--begin", is_flag=True, help="Iniciar Research Design (CP3)."),
+    ] = False,
+    review: Annotated[
+        bool,
+        typer.Option("--review", is_flag=True, help="Aplicar correções ao último preview do CP3."),
+    ] = False,
+    signoff: Annotated[
+        bool,
+        typer.Option("--signoff", is_flag=True, help="Aprovar preview e gerar arquivo final sem marcações."),
+    ] = False,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Diretório do workspace."),
+    ] = None,
+) -> None:
+    """Gerenciar o Research Design (Checkpoint 3).
+
+    Use uma das flags para selecionar a ação:\n
+      --begin     Iniciar a pesquisa de design metodológico\n
+      --review    Revisar o último preview (aplicar correções do Word)\n
+      --signoff   Aprovar o preview atual e gerar arquivo final
+    """
+    flags = [begin, review, signoff]
+    if sum(flags) > 1:
+        console.print("[red]Use apenas uma flag por vez: --begin, --review ou --signoff.[/red]")
+        raise typer.Exit(1)
+    if not any(flags):
+        console.print(
+            "\n[bold]ai-skill design[/bold]  —  Research Design (CP3)\n\n"
+            "  [cyan]--begin[/cyan]     Iniciar a pesquisa de design metodológico\n"
+            "  [cyan]--review[/cyan]    Revisar o último preview (aplicar correções do Word)\n"
+            "  [cyan]--signoff[/cyan]   Aprovar o preview atual e gerar arquivo final\n"
+        )
+        raise typer.Exit(0)
+
+    if begin:
+        begin_design(workspace=workspace)
+    elif review:
+        _design_review(workspace=workspace)
+    elif signoff:
+        ws_path = _resolve_workspace_path(workspace, state_subdir=True)
+        if ws_path is None:
+            raise typer.Exit(1)
+        _signoff_checkpoint(ws_path, 3)
+
+
+@app.command("begin-design")
+def begin_design(
+    workspace: Annotated[
+        Path | None,
+        typer.Option(
+            "--workspace", "-w",
+            help="ProjectWorkspace ou diretório .state/ do projeto.",
+        ),
+    ] = None,
+) -> None:
+    """Iniciar o Research Design (Checkpoint 3).
+
+    Requer que o Checkpoint 2 (Literature Review) já esteja aprovado.
+    """
+    _configure_logging(os.environ.get("AI_SKILL_LOG_LEVEL", "WARNING"))
+
+    # --- Resolve project path ---
+    resolved = _resolve_workspace_path(workspace, state_subdir=False)
+    if resolved is None:
+        raise typer.Exit(1)
+
+    if (resolved / "workspace.yaml").exists():
+        project_path = resolved
+        state_path = resolved / ".state"
+    elif (resolved.parent / "workspace.yaml").exists():
+        project_path = resolved.parent
+        state_path = resolved
+    else:
+        console.print(
+            "[red]Workspace não reconhecido.[/red]\n"
+            "[dim]Aponte --workspace para o ProjectWorkspace "
+            "ou para o diretório .state/ dentro dele.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # --- Validate CP2 [final].docx exists ---
+    from ai_skill.core.project_workspace import ProjectWorkspace
+    pw = ProjectWorkspace.from_path(project_path)
+    final_cp2 = pw.checkpoint_final_path(2)
+
+    if not final_cp2.exists():
+        final_cp1 = pw.checkpoint_final_path(1)
+        console.print(
+            f"\n[red]✗ Checkpoint 2 não aprovado.[/red]\n"
+            f"  O arquivo [bold]{final_cp2.name}[/bold] não foi encontrado em:\n"
+            f"  {project_path}\n"
+            f"\n[dim]Complete o Checkpoint 2 antes de iniciar o Research Design:[/dim]\n"
+            f"  ai-skill literature --begin --workspace \"{project_path}\"\n"
+            f"  ai-skill literature --signoff --workspace \"{state_path}\""
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Checkpoint 2 aprovado: [dim]{final_cp2.name}[/dim]")
+
+    # --- Warn if CP3 work already exists ---
+    _warn_overwrite(project_path, checkpoints=[3])
+
+    # --- Load or reconstruct state ---
+    from ai_skill.core.graph import build_cp3_graph
+    from ai_skill.core.workspace import ResearchWorkspace
+
+    ws = ResearchWorkspace(state_path)
+    state = ws.load_state()
+
+    if state is None:
+        state = _reconstruct_state_for_design(project_path, state_path)
+        if state is None:
+            console.print(
+                "[red]Não foi possível carregar o estado do projeto.[/red]\n"
+                "[dim]Tente re-rodar:[/dim]\n"
+                f"  ai-skill literature --begin --workspace \"{project_path}\""
+            )
+            raise typer.Exit(1)
+
+    # Guarantee CP1 and CP2 are marked approved so graph routing passes gates
+    state["charter_approved"] = True
+    state["literature_approved"] = True
+    state["user_feedback"] = None
+    state["attempt"] = 0
+
+    # Inject CP1 charter text for CP3 compile context
+    final_cp1 = pw.checkpoint_final_path(1)
+    if final_cp1.exists():
+        state["charter_document_text"] = _read_docx_text(final_cp1)
+
+    # Set correct stage for CP3 routing
+    from ai_skill.core.pipeline_stages import PipelineStage as _PS
+    state["stage"] = _PS.RESEARCH_DESIGN
+
+    # Build the CP3 handoff context
+    _full_obj = state.get("objective") or {}
+    review_doc = state.get("literature_review_doc") or {}
+    sections = review_doc.get("sections") or []
+    # Condense literature summary: titles + first 300 chars of each section
+    literature_summary = "\n\n".join(
+        f"## {s.get('section_title', '')}\n{(s.get('content') or '')[:300]}"
+        for s in sections
+    )
+    state["cp3_context"] = {
+        "topic":                   _full_obj.get("topic") or "",
+        "goals":                   list(_full_obj.get("goals") or []),
+        "scope_constraints":       list(_full_obj.get("scope_constraints") or []),
+        "methodology_preference":  _full_obj.get("methodology_preference") or "",
+        "literature_summary":      literature_summary,
+    }
+
+    topic = _full_obj.get("topic", "")
+    console.print(
+        f"\n[bold]Iniciando Research Design[/bold]"
+        + (f": {topic}" if topic else "")
+    )
+
+    # --- Stream the CP3 graph ---
+    graph_instance = build_cp3_graph()
+    current_state: dict = dict(state)
+
+    try:
+        for event in graph_instance.stream(state, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                if node_name == "__interrupt__":
+                    ws.save_state(current_state)
+                    _handle_checkpoint(node_output, current_state, state_path)
+                    return
+                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])))
+                if isinstance(node_output, dict):
+                    current_state.update(node_output)
+                    ws.save_state(current_state)
+                    if (
+                        node_name == "review_design"
+                        and node_output.get("design_approved")
+                    ):
+                        _finalize_checkpoint(state_path, 3)
+    except _GRAPH_INTERRUPT as _exc:  # type: ignore[misc]
+        ws.save_state(current_state)
+        _handle_checkpoint(_exc, current_state, state_path)
+        return
+    except KeyboardInterrupt:
+        ws.save_state(current_state)
+        console.print("\n[yellow]Pesquisa pausada. Retome com:[/yellow]")
+        console.print(f"  ai-skill design --review --workspace \"{state_path}\"")
+        sys.exit(0)
+
+
+def _design_review(workspace: Path | None) -> None:
+    """Apply researcher corrections from the last CP3 preview and re-run."""
+    from ai_skill.core.graph import build_cp3_graph
+    from ai_skill.core.workspace import ResearchWorkspace
+
+    _configure_logging(os.environ.get("AI_SKILL_LOG_LEVEL", "WARNING"))
+
+    resolved = _resolve_workspace_path(workspace, state_subdir=True)
+    if resolved is None:
+        raise typer.Exit(1)
+
+    if (resolved / "workspace.yaml").exists():
+        project_path = resolved
+        state_path = resolved / ".state"
+    elif (resolved.parent / "workspace.yaml").exists():
+        project_path = resolved.parent
+        state_path = resolved
+    else:
+        console.print("[red]Workspace não reconhecido.[/red]")
+        raise typer.Exit(1)
+
+    from ai_skill.core.project_workspace import ProjectWorkspace
+    pw = ProjectWorkspace.from_path(project_path)
+
+    last_preview = pw.get_last_preview(3)
+    if last_preview is None:
+        console.print(
+            "[red]Nenhum preview do CP3 encontrado.[/red]\n"
+            "[dim]Execute primeiro:[/dim]  "
+            f"ai-skill design --begin --workspace \"{project_path}\""
+        )
+        raise typer.Exit(1)
+
+    ws = ResearchWorkspace(state_path)
+    state = ws.load_state() or {}
+
+    feedback = _extract_docx_corrections(last_preview)
+    if not feedback:
+        console.print(
+            "[yellow]Nenhuma correção encontrada no preview.[/yellow]\n"
+            "[dim]Adicione comentários, marcas de revisão ou realce amarelo no arquivo:[/dim]\n"
+            f"  {last_preview}"
+        )
+        raise typer.Exit(0)
+
+    formatted_feedback = _format_corrections_for_llm(feedback)
+    state["user_feedback"] = formatted_feedback
+    state["design_approved"] = False
+
+    from ai_skill.core.pipeline_stages import PipelineStage as _PS
+    state["stage"] = _PS.RESEARCH_DESIGN
+
+    graph_instance = build_cp3_graph()
+    current_state: dict = dict(state)
+
+    try:
+        for event in graph_instance.stream(state, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                if node_name == "__interrupt__":
+                    ws.save_state(current_state)
+                    _handle_checkpoint(node_output, current_state, state_path)
+                    return
+                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])))
+                if isinstance(node_output, dict):
+                    current_state.update(node_output)
+                    ws.save_state(current_state)
+                    if (
+                        node_name == "review_design"
+                        and node_output.get("design_approved")
+                    ):
+                        _finalize_checkpoint(state_path, 3)
+    except _GRAPH_INTERRUPT as _exc:  # type: ignore[misc]
+        ws.save_state(current_state)
+        _handle_checkpoint(_exc, current_state, state_path)
+        return
+    except KeyboardInterrupt:
+        ws.save_state(current_state)
+        console.print("\n[yellow]Revisão pausada. Retome com:[/yellow]")
+        console.print(f"  ai-skill design --review --workspace \"{state_path}\"")
+        sys.exit(0)
+
+
+def _reconstruct_state_for_design(project_path: Path, state_path: Path) -> dict | None:
+    """Build a minimal ResearchState for the design command.
+
+    Used when the state file is missing but CP2 [final].docx exists.
+
+    Args:
+        project_path: Root of the ProjectWorkspace.
+        state_path: Path to the .state/ directory.
+
+    Returns:
+        A state dict with ``literature_approved=True``, or None on failure.
+    """
+    import yaml as _yaml
+    from ai_skill.core.project_workspace import ProjectWorkspace
+    from ai_skill.core.state import initial_state
+
+    meta_file = project_path / "workspace.yaml"
+    if not meta_file.exists():
+        return None
+    try:
+        meta = _yaml.safe_load(meta_file.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+
+    topic = meta.get("topic", "")
+    state: dict = dict(initial_state(str(state_path), topic=topic))
+
+    pw = ProjectWorkspace.from_path(project_path)
+    final_cp1 = pw.checkpoint_final_path(1)
+    final_cp2 = pw.checkpoint_final_path(2)
+
+    if final_cp1.exists():
+        objective = _parse_objective_from_docx(final_cp1)
+        if objective:
+            state["objective"] = objective
+        state["charter_document_text"] = _read_docx_text(final_cp1)
+
+    state["charter_approved"] = True
+    state["literature_approved"] = True
+
+    # CP2 doc text is used as context during design compilation but we don't
+    # reconstruct the full literature_review_doc here — compile_design reads
+    # the cp3_context["literature_summary"] which is built by begin_design().
+    if final_cp2.exists():
+        state["active_checkpoint"] = 2  # will be updated to 3 by compile_design
+
+    return state
 
 
 if __name__ == "__main__":

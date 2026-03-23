@@ -92,3 +92,19 @@ def test_workspace_initialise(tmp_path: "pytest.TempPathFactory") -> None:  # ty
     assert (tmp_path / "test-ws" / "research-log.md").exists()
     assert (tmp_path / "test-ws" / "findings.md").exists()
     assert (tmp_path / "test-ws" / ".cache").is_dir()
+
+
+def test_cp3_graph_compiles_without_error() -> None:
+    """The CP3 StateGraph compiles without configuration errors."""
+    from ai_skill.core.graph import build_cp3_graph
+
+    graph = build_cp3_graph()
+    assert graph is not None
+
+
+def test_cp3_graph_mermaid_contains_compile_design() -> None:
+    """The compiled CP3 graph produces a Mermaid diagram with compile_design node."""
+    from ai_skill.core.graph import build_cp3_graph
+
+    mermaid = build_cp3_graph().get_graph().draw_mermaid()
+    assert "compile_design" in mermaid

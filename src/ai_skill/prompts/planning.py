@@ -8,6 +8,35 @@ from typing import Any
 from ai_skill.core.state import ResearchObjective
 
 
+def _stage_context(objective: ResearchObjective) -> dict[str, Any]:
+    """Return the strict subset of objective fields exposed to stage-scoped LLMs.
+
+    This is an explicit allowlist — only the three named fields are included.
+    Any field added to ResearchObjective in the future is withheld by default.
+    There is no dict iteration, no key-filter expression, and no catch-all that
+    could accidentally forward a field that should stay hidden.
+
+    Allowed:
+        topic           — needed so the LLM knows the research subject.
+        goals           — needed so search steps are thematically grounded.
+        scope_constraints — needed so the planner respects declared boundaries.
+
+    Withheld (with reason):
+        success_metrics      — global project deliverables; causes the planner to
+                               design steps toward implementation/publication/etc.
+        methodology_preference — irrelevant to search/collection work.
+        bibliography_style   — irrelevant at planning time.
+        language             — irrelevant at planning time.
+        generated_at         — metadata; not useful to the LLM.
+        stage_guidelines     — passed separately as stage_guidelines_json.
+    """
+    return {
+        "topic": objective.get("topic") or "",
+        "goals": list(objective.get("goals") or []),
+        "scope_constraints": list(objective.get("scope_constraints") or []),
+    }
+
+
 PLANNING_SYSTEM = """\
 You are a research planning expert. Your task is to create an execution plan
 for an academic research pipeline using available skills.
@@ -22,52 +51,55 @@ Rules:
 - Steps with no dependencies (depends_on: []) can run in parallel.
 - Keep the plan focused on the current stage objectives.
 - Estimate cost as: low (<10 API calls), medium (10-50), high (>50).
+- MAXIMUM 15 steps per plan. Be concise — depth over breadth.
+- DO NOT pre-write research content inside parameters. Parameters should be
+  search queries, URLs, or short instructions — never multi-paragraph prose.
+  The skills will fetch and summarize the actual content at runtime.
+- String parameter values must be ≤ 300 characters each.
 
 content_summarizer — IMPORTANT:
-- Requires EITHER "content" (pre-fetched text) OR "source_url" (auto-fetched).
+- Requires EITHER "content" (pre-fetched text, ≤ 300 chars) OR "source_url".
   NEVER call it without at least one of these — it will fail.
-- When chaining after article_search or web_search, pass the article
-  abstract/snippet as "content" to avoid an extra HTTP round-trip.
+- Prefer "source_url" so the skill fetches live content. Use "content" only
+  for short abstracts passed from a preceding article_search step.
 - With URL only:  {{"source_url": "https://...", "content_type": "article", "source_year": 2023}}
-- With text:      {{"content": "<fetched text>", "source_url": "https://...", "content_type": "article"}}
+- With text:      {{"content": "<abstract ≤ 300 chars>", "source_url": "https://...", "content_type": "article"}}
 """
 
 PLANNING_USER = """\
-Research objective (overall context):
+Tópico, objetivos e restrições de escopo da pesquisa:
 {objective_json}
 
-Current stage: {stage}
-Attempt: {attempt} / 5
+Etapa atual: {stage}
+Tentativa: {attempt} / 5
 
-Stage-specific guidelines (these are the primary driver for this plan):
+Diretrizes desta etapa (driver principal do plano):
 {stage_guidelines_json}
 
-Previous attempt gaps (empty on first attempt):
+Lacunas da tentativa anterior (vazio na primeira tentativa):
 {gaps_json}
 
-Produce an ExecutionPlan whose steps directly address the stage-specific guidelines
-above. Use the overall objective only for thematic context. Fill the gaps listed if
-this is a retry.
+Produza um ExecutionPlan cujos steps endereçam diretamente as diretrizes acima.
 """
 
 PLANNING_USER_WITH_GUIDANCE = """\
-Research objective (overall context):
+Tópico, objetivos e restrições de escopo da pesquisa:
 {objective_json}
 
-Current stage: {stage}
-Attempt: {attempt} / 5
+Etapa atual: {stage}
+Tentativa: {attempt} / 5
 
-Stage-specific guidelines (primary driver):
+Diretrizes desta etapa (driver principal do plano):
 {stage_guidelines_json}
 
-Previous attempt gaps:
+Lacunas da tentativa anterior:
 {gaps_json}
 
-ORIENTAÇÃO DO PESQUISADOR (considerar com prioridade máxima):
+ORIENTAÇÃO DO PESQUISADOR (prioridade máxima):
 {user_guidance}
 
 Produza um ExecutionPlan que incorpore diretamente a orientação acima,
-além de endereçar as lacunas identificadas e seguir as diretrizes da etapa.
+endereçando as lacunas e seguindo as diretrizes da etapa.
 """
 
 
@@ -102,14 +134,8 @@ def build_planning_messages(
     """
     effective_guidelines: list[str] = stage_guidelines or objective.get("success_metrics", [])
 
-    # When stage_guidelines are present, strip success_metrics from the objective
-    # so the planner cannot accidentally design steps towards global project goals
-    # (implementation, experiments, publication) that are out of scope for this stage.
     if stage_guidelines:
-        objective_for_prompt: dict[str, Any] = {
-            k: v for k, v in dict(objective).items()
-            if k not in ("success_metrics",)
-        }
+        objective_for_prompt: dict[str, Any] = _stage_context(objective)
     else:
         objective_for_prompt = dict(objective)
 

@@ -234,8 +234,11 @@ class LLMClient:
                 )
                 time.sleep(delay)
             except Exception as exc:
+                # Truncate the exception string — raw instructor/Anthropic
+                # Message objects can be thousands of chars and flood the log.
+                exc_summary = str(exc)[:300]
                 raise LLMClientError(
-                    f"Structured completion failed: {exc}"
+                    f"Structured completion failed: {exc_summary}"
                 ) from exc
 
         raise LLMClientError(

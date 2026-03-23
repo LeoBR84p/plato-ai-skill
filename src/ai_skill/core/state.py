@@ -28,6 +28,12 @@ class SourceVerification(TypedDict, total=False):
             fetched content is consistent with what the review claims.
         verification_note: Short explanation of the verification outcome.
         access_date: Date of access in ABNT format (e.g. "23 mar. 2026").
+        access_method: How content was retrieved — "HTTP" for direct HTML fetch,
+            "Semantic_Scholar_API" when the S2 Graph API was used,
+            "PDF_direto" for a direct PDF URL, or "PDF_fallback" when a
+            PDF/download link was followed from the landing page.
+            "PDF_direto" and "PDF_fallback" trigger an "Acesso direto (sem API)"
+            badge in the docx; "HTTP" and "Semantic_Scholar_API" do not.
     """
 
     reference_number: int
@@ -37,6 +43,7 @@ class SourceVerification(TypedDict, total=False):
     content_matches: bool
     verification_note: str
     access_date: str
+    access_method: str
 
 
 class LiteratureReviewSection(TypedDict):
@@ -49,6 +56,78 @@ class LiteratureReviewSection(TypedDict):
 
     section_title: str
     content: str
+
+
+class ResearchDesignSection(TypedDict):
+    """One section of the research design document.
+
+    Attributes:
+        section_title: Heading for the section.
+        content: Body text (markdown prose).
+    """
+
+    section_title: str
+    content: str
+
+
+class ResearchDesignDoc(TypedDict, total=False):
+    """Structured research design document produced by CP3.
+
+    Attributes:
+        sections: Ordered list of sections covering paradigm, model, PICOS,
+            instruments, sampling, FAIR, ethics, risks, and stakeholders.
+        study_type: Research design classification
+            (experimental | quasi-experimental | observational | case-study |
+            action-research | systematic-review | mixed-methods).
+        research_paradigm: Epistemological paradigm
+            (quantitative | qualitative | mixed).
+        epistemological_stance: Worldview
+            (post-positivist | constructivist | pragmatic | transformative).
+        hypotheses: Testable hypothesis statements (OR Step 2 format).
+        research_questions: Alternative/complementary research questions.
+        variables: List of dicts with keys: name, type, description,
+            operationalization, measurement_scale.
+        instruments: Data collection instruments with validation references.
+        sampling_strategy: Description of sampling approach and frame.
+        sample_size_justification: Power analysis or saturation rationale.
+        ethical_considerations: Consent, privacy, CEP/IRB requirements.
+        validity_threats: Internal and external validity threats identified.
+        mitigation_strategies: List of dicts with keys: threat, mitigation,
+            contingency.
+        data_management_plan: FAIR-compliant data management summary.
+        target_journal_tier: Target publication venue quartile (Q1/Q2/Q3/Q4).
+        reporting_standard: Applicable reporting guideline
+            (CONSORT | STROBE | PRISMA | SQUIRE | outro | não aplicável).
+        metrics_and_kpis: KPIs, acceptance thresholds, statistical power, and
+            minimum sample size with justification (ISO 9001:2015).
+        data_sources: Primary and secondary data sources with quality criteria
+            (credibility, recency, accessibility) and FAIR compliance statement.
+        collection_protocol: Step-by-step data collection protocol with
+            instruments, tools, and acceptance criteria for each step.
+        methodology_timeline: PMBOK-aligned milestone schedule linking
+            CP3 (design) → CP4 (collection) → CP5 (analysis) with time estimates.
+    """
+
+    sections: list[ResearchDesignSection]
+    study_type: str
+    research_paradigm: str
+    epistemological_stance: str
+    hypotheses: list[str]
+    research_questions: list[str]
+    variables: list[dict[str, Any]]
+    instruments: list[str]
+    sampling_strategy: str
+    sample_size_justification: str
+    ethical_considerations: str
+    validity_threats: list[str]
+    mitigation_strategies: list[dict[str, Any]]
+    data_management_plan: str
+    target_journal_tier: str
+    reporting_standard: str
+    metrics_and_kpis: list[str]
+    data_sources: list[str]
+    collection_protocol: str
+    methodology_timeline: str
 
 
 class LiteratureReviewDoc(TypedDict, total=False):
@@ -246,6 +325,20 @@ class ResearchState(TypedDict, total=False):
     literature_review_doc: LiteratureReviewDoc
     charter_document_text: str  # extracted text of CP1 [final].docx — CP2 context
 
+    # Research design (Checkpoint 3)
+    research_design_doc: ResearchDesignDoc
+    design_approved: bool
+
+    # CP3 handoff — populated by begin_design() before CP3 graph starts.
+    # Contains topic, goals, scope_constraints, methodology_preference, literature_summary.
+    cp3_context: dict
+
+    # CP2 handoff — populated by begin_literature_review() before CP2 graph starts.
+    # Contains ONLY the fields CP2 nodes are allowed to see: topic, goals,
+    # scope_constraints.  success_metrics and all other CP1-only fields are absent.
+    # When present, plan() and evaluate() use this instead of the full objective.
+    cp2_context: dict
+
     # Document versioning
     document_version: int
     workspace_path: str
@@ -282,6 +375,7 @@ def initial_state(workspace_path: str, topic: str = "") -> ResearchState:
         checkpoint_pending=False,
         charter_approved=False,
         literature_approved=False,
+        design_approved=False,
         active_checkpoint=1,
         charter_document_text="",
         user_feedback=None,

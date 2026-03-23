@@ -25,12 +25,17 @@ The charter must contain:
 Stage keys and their focus areas:
 
   "literature_review"
-    — Directives for the bibliographic research phase (CP2). Examples:
-      thematic sub-areas to cover, minimum number of primary references (aim ≥ 40),
-      target time window (e.g. last 10 years, with ≥ 30 % from the last 5),
-      priority databases (arXiv, Semantic Scholar, Scopus, Web of Science, etc.),
-      core search terms and Boolean combinations, PRISMA screening criteria,
-      expected thematic structure of the review.
+    — Directives for the bibliographic research phase (CP2). These guidelines
+      must describe ONLY what can be accomplished by searching and reading papers
+      (article_search / web_search / content_summarizer skills). Examples:
+      thematic sub-areas to cover, number of distinct queries required,
+      minimum total_found across all searches, target time window,
+      priority databases (arXiv, Semantic Scholar, Web of Science, etc.),
+      core search terms and Boolean combinations.
+      PROHIBITED: framework development, article writing or submission, formal
+      PRISMA flowchart completion, experiment execution, dataset collection, or
+      any deliverable that requires work beyond bibliographic search and
+      summarisation. Those belong in later stage guidelines.
 
   "research_design"
     — Directives for the methodology and design phase (CP3). Examples:
