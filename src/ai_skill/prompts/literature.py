@@ -51,8 +51,9 @@ Requirements:
    authors, years, or claims not supported by the sources.
 8. **Consistency**: same citation style throughout; no mixed numbering.
 9. **Reference summaries**: For every entry in the references list, write a `summary`
-   of up to 200 words describing the article's main argument, methodology, key findings,
-   and relevance to the research objectives — based only on the provided findings.
+   of 300 to 500 words describing the article's main argument, methodology, key findings,
+   conclusions, and relevance to the research objectives — based only on the provided
+   findings. The conclusions of the article are mandatory and must be explicitly addressed.
 """
 
 COMPILE_USER = """\

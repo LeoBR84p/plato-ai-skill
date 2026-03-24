@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ai_skill.skills.base import BaseSkill, SkillInput, SkillMeta
+from ai_skill.skills.base import BaseSkill, SkillMeta
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,9 @@ class SkillRegistry:
             "pdf_reader",
             "content_summarizer",
             "google_drive",
+            "exa_search",
+            "firecrawl_scraper",
+            "tavily_search",
         ]
         skills_pkg_path = Path(__file__).parent
 

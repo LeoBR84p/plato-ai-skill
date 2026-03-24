@@ -603,7 +603,9 @@ def resume(
             "marcas de revisão, comentários nem realces."
         )
         if typer.confirm("\nDeseja gerar o arquivo final?", default=True):
-            _finalize_checkpoint(workspace, active_cp)
+            # Use _signoff_checkpoint so CP2 also downloads PDFs to attachments/,
+            # updates literature_approved in state, and triggers CP3 start.
+            _signoff_checkpoint(workspace, active_cp)
         raise typer.Exit(0)
 
     state["user_feedback"] = _format_corrections_for_llm(corrections)

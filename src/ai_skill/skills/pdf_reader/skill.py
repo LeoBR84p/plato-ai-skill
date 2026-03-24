@@ -113,7 +113,35 @@ class PdfReaderSkill(BaseSkill):
                     return self._error_output(
                         f"URL blocked by Safe Browsing: {url}"
                     )
-                pdf_path, tmp_file = self._download_pdf(url)
+                try:
+                    pdf_path, tmp_file = self._download_pdf(url)
+                except Exception as dl_exc:
+                    # Binary download failed — try text extraction via API fallbacks
+                    logger.warning(
+                        "pdf_reader: binary download failed for %s (%s). "
+                        "Trying Firecrawl / Exa / Tavily text extraction.",
+                        url, dl_exc,
+                    )
+                    text = self._fetch_text_via_apis(url)
+                    if text:
+                        return SkillOutput(
+                            skill_name="pdf_reader",
+                            result={
+                                "text": text,
+                                "pages": 0,
+                                "total_pages": 0,
+                                "metadata": {},
+                                "backend": "api_text_fallback",
+                            },
+                            confidence=0.6,
+                            sources=[url],
+                            error=None,
+                            cached=False,
+                        )
+                    return self._error_output(
+                        f"PDF download failed and all text-extraction fallbacks "
+                        f"exhausted for {url}. Original error: {dl_exc}"
+                    )
             else:
                 pdf_path = Path(file_path)  # type: ignore[arg-type]
                 if not pdf_path.exists():
@@ -166,14 +194,33 @@ class PdfReaderSkill(BaseSkill):
             Tuple of (Path to temp file, the NamedTemporaryFile object to close later).
 
         Raises:
-            ValueError: If the download exceeds _MAX_DOWNLOAD_SIZE.
+            ValueError: If the download exceeds _MAX_DOWNLOAD_SIZE or the
+                server returns non-PDF content.
             httpx.HTTPError: On network errors.
         """
+        _UA = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
         downloaded = 0
 
-        with httpx.stream("GET", url, follow_redirects=True, timeout=30.0) as response:
+        with httpx.stream(
+            "GET", url,
+            follow_redirects=True,
+            timeout=30.0,
+            headers={"User-Agent": _UA, "Accept": "application/pdf,*/*"},
+        ) as response:
             response.raise_for_status()
+            ct = response.headers.get("content-type", "").lower()
+            # Bail early if the server returns HTML instead of PDF
+            if "html" in ct and "pdf" not in ct:
+                tmp.close()
+                raise ValueError(
+                    f"Server returned HTML instead of PDF "
+                    f"(Content-Type: {ct}). URL may be a landing page."
+                )
             for chunk in response.iter_bytes(chunk_size=65536):
                 downloaded += len(chunk)
                 if downloaded > _MAX_DOWNLOAD_SIZE:
@@ -185,6 +232,65 @@ class PdfReaderSkill(BaseSkill):
 
         tmp.flush()
         return Path(tmp.name), tmp
+
+    @staticmethod
+    def _fetch_text_via_apis(url: str) -> str:
+        """Attempt to extract PDF text via Firecrawl, Exa, or Tavily.
+
+        Used as a fallback when the binary PDF download fails (bot-blocking,
+        auth redirect, etc.). Returns plain text or empty string.
+        """
+        import os
+
+        # ── Firecrawl ─────────────────────────────────────────────
+        fc_key = os.environ.get("FIRECRAWL_API_KEY", "")
+        if fc_key:
+            try:
+                from firecrawl import FirecrawlApp  # type: ignore[import-untyped]
+                app = FirecrawlApp(api_key=fc_key)
+                scrape_fn = getattr(app, "scrape", None) or getattr(app, "scrape_url")
+                result = scrape_fn(url, formats=["markdown"])
+                md = (getattr(result, "markdown", None) or
+                      (result.get("markdown", "") if isinstance(result, dict) else ""))
+                if md:
+                    logger.debug("pdf_reader: Firecrawl text fallback OK for %s (%d chars)", url, len(md))
+                    return md
+            except Exception as exc:
+                logger.debug("pdf_reader: Firecrawl fallback failed for %s: %s", url, exc)
+
+        # ── Exa get_contents ──────────────────────────────────────
+        exa_key = os.environ.get("EXA_API_KEY", "")
+        if exa_key:
+            try:
+                from exa_py import Exa  # type: ignore[import-untyped]
+                exa = Exa(api_key=exa_key)
+                res = exa.get_contents([url], text={"max_characters": 10000})
+                items = getattr(res, "results", [])
+                if items:
+                    text = getattr(items[0], "text", "") or ""
+                    if text:
+                        logger.debug("pdf_reader: Exa text fallback OK for %s (%d chars)", url, len(text))
+                        return text
+            except Exception as exc:
+                logger.debug("pdf_reader: Exa fallback failed for %s: %s", url, exc)
+
+        # ── Tavily extract ────────────────────────────────────────
+        tv_key = os.environ.get("TAVILY_API_KEY", "")
+        if tv_key:
+            try:
+                from tavily import TavilyClient  # type: ignore[import-untyped]
+                client = TavilyClient(api_key=tv_key)
+                resp = client.extract(urls=[url])
+                results = resp.get("results", [])
+                if results:
+                    text = results[0].get("raw_content", "") or ""
+                    if text:
+                        logger.debug("pdf_reader: Tavily text fallback OK for %s (%d chars)", url, len(text))
+                        return text
+            except Exception as exc:
+                logger.debug("pdf_reader: Tavily fallback failed for %s: %s", url, exc)
+
+        return ""
 
     def _extract_with_pymupdf(
         self,

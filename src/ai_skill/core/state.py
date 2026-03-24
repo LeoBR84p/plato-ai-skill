@@ -28,12 +28,18 @@ class SourceVerification(TypedDict, total=False):
             fetched content is consistent with what the review claims.
         verification_note: Short explanation of the verification outcome.
         access_date: Date of access in ABNT format (e.g. "23 mar. 2026").
-        access_method: How content was retrieved — "HTTP" for direct HTML fetch,
-            "Semantic_Scholar_API" when the S2 Graph API was used,
-            "PDF_direto" for a direct PDF URL, or "PDF_fallback" when a
-            PDF/download link was followed from the landing page.
-            "PDF_direto" and "PDF_fallback" trigger an "Acesso direto (sem API)"
-            badge in the docx; "HTTP" and "Semantic_Scholar_API" do not.
+        access_method: How content was retrieved. Possible values:
+            "HTTP"                — direct HTML fetch via urllib.
+            "Semantic_Scholar_API"— S2 Graph API (abstract/metadata).
+            "Tavily"              — Tavily /extract API.
+            "Firecrawl"           — Firecrawl headless-browser scrape.
+            "Playwright"          — local headless Chromium via Playwright.
+            "PDF_direto"          — direct PDF URL downloaded via httpx.
+            "PDF_fallback"        — PDF link found and followed from landing page.
+            "HTTP", "Semantic_Scholar_API", "Tavily", and "Firecrawl" are
+            treated as API access — no badge in the docx.
+            "Playwright", "PDF_direto", and "PDF_fallback" show an
+            "Acesso direto (sem API)" badge.
     """
 
     reference_number: int

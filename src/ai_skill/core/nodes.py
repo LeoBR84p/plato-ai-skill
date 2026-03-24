@@ -135,9 +135,10 @@ class _LiteratureSourceLLM(BaseModel):
     )
     summary: str = Field(
         description=(
-            "Summary of the article's content in up to 200 words (pt-BR). "
-            "Describe the main argument, methodology, key findings, and relevance "
-            "to the research objectives — based solely on information in the findings."
+            "Summary of the article's content in 300 to 500 words (pt-BR). "
+            "Must cover: main argument, methodology, key findings, conclusions, "
+            "and relevance to the research objectives — based solely on information "
+            "in the findings. The conclusions section is mandatory."
         )
     )
 
@@ -1030,11 +1031,8 @@ def verify_literature(
     }
     is_correction_cycle = bool(prev_by_num)
 
-    # Determine feedback context for smart skipping
-    user_feedback: str = state.get("user_feedback") or ""
-    has_any_marks = bool(user_feedback)
-
     # Reference numbers explicitly mentioned in feedback (comment context)
+    user_feedback: str = state.get("user_feedback") or ""
     feedback_ref_nums: set[int] = set()
     if user_feedback:
         for m in _re.findall(r"\[(\d+)\]", user_feedback):
@@ -1069,22 +1067,23 @@ def verify_literature(
                     )
                     return SourceVerification(**prev)
 
-                # ⚠ Warning: skip — no comment/highlight for this section
+                # ⚠ Warning: always re-verify on correction cycles — the claim may
+                # have been updated by refine_literature (which clears user_feedback
+                # before verify runs, so feedback_ref_nums is unreliable here).
                 if was_accessible and not was_match:
                     logger.debug(
-                        "verify_literature: [%d] ⚠ no comment context — skipping.", ref_num
+                        "verify_literature: [%d] ⚠ correction cycle — re-verifying "
+                        "(claim may have changed).",
+                        ref_num,
                     )
-                    return SourceVerification(**prev)
+                    # Fall through to actual fetch + LLM verification
 
-                # ✗ Red X: retry only when marks/feedback exist in the document
+                # ✗ Red X: always retry in correction cycles — a previous failure may
+                # have been caused by a transient error (rate-limit, timeout, etc.)
+                # rather than genuine inaccessibility.
                 if not was_accessible:
-                    if not has_any_marks:
-                        logger.debug(
-                            "verify_literature: [%d] ✗ no marks in document — skipping.", ref_num
-                        )
-                        return SourceVerification(**prev)
                     logger.debug(
-                        "verify_literature: [%d] ✗ retrying (marks present).", ref_num
+                        "verify_literature: [%d] ✗ correction cycle — retrying.", ref_num
                     )
 
         # --- Perform actual fetch + LLM verification ---
@@ -2174,8 +2173,11 @@ def _fetch_via_semantic_scholar_api(url: str, timeout: int = 15) -> tuple[bool, 
             import json as _json
             data: dict = _json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        logger.debug("S2 API error for %s (paper_id=%s): %s", url, paper_id, exc)
-        return False, "", "Semantic_Scholar_API"
+        logger.debug(
+            "S2 API HTTP error for %s (paper_id=%s): %s — falling back to HTTP/Tavily/Firecrawl.",
+            url, paper_id, exc,
+        )
+        return None  # let the caller fall back to HTTP/Tavily/Firecrawl/Playwright
     except Exception as exc:
         logger.debug("S2 API fetch failed for %s: %s", url, exc)
         return None  # let the caller fall back to HTTP
@@ -2190,6 +2192,145 @@ def _fetch_via_semantic_scholar_api(url: str, timeout: int = 15) -> tuple[bool, 
     return True, text[:3000], "Semantic_Scholar_API"
 
 
+def _fetch_via_tavily(url: str) -> tuple[bool, str, str] | None:
+    """Fetch page content via Tavily's /extract endpoint.
+
+    Lighter-weight than Firecrawl (no headless browser), but can bypass some
+    bot-blocked pages that urllib cannot reach. Falls through (returns None) when
+    the API key is absent or the extraction fails, so the caller can escalate to
+    Firecrawl or Playwright.
+
+    Args:
+        url: The URL to extract.
+
+    Returns:
+        ``(True, text_snippet, "Tavily")`` on success, or ``None`` on failure.
+    """
+    import os
+
+    api_key = os.environ.get("TAVILY_API_KEY", "")
+    if not api_key:
+        return None
+
+    try:
+        from tavily import TavilyClient  # type: ignore[import-untyped]
+
+        client = TavilyClient(api_key=api_key)
+        response = client.extract(urls=[url])
+        results = response.get("results", [])
+        if not results:
+            return None
+
+        text: str = results[0].get("raw_content", "") or ""
+        if not text:
+            return None
+
+        logger.debug("Tavily extract succeeded for %s (%d chars).", url, len(text))
+        return True, text[:3000], "Tavily"
+    except Exception as exc:
+        logger.debug("Tavily extract failed for %s: %s", url, exc)
+        return None
+
+
+def _fetch_via_firecrawl(url: str) -> tuple[bool, str, str] | None:
+    """Scrape a URL via the Firecrawl API as a fallback for bot-blocked pages.
+
+    Args:
+        url: The URL to scrape.
+
+    Returns:
+        ``(accessible, text_snippet, "Firecrawl")`` on success, or ``None`` when
+        the API key is not configured or the scrape fails (caller should fall back
+        to returning ``False``).
+    """
+    import os
+
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "")
+    if not api_key:
+        return None
+
+    try:
+        from firecrawl import FirecrawlApp  # type: ignore[import-untyped]
+
+        app = FirecrawlApp(api_key=api_key)
+        # firecrawl-py ≥ 1.0 uses .scrape(); older versions used .scrape_url()
+        scrape_fn = getattr(app, "scrape", None) or getattr(app, "scrape_url")
+        result = scrape_fn(url, formats=["markdown"])
+
+        text = ""
+        if hasattr(result, "markdown") and result.markdown:
+            text = result.markdown
+        elif isinstance(result, dict):
+            text = result.get("markdown", "") or result.get("content", "")
+
+        logger.debug("Firecrawl fetch succeeded for %s (%d chars).", url, len(text))
+        return True, text[:3000], "Firecrawl"
+    except Exception as exc:
+        logger.debug("Firecrawl fetch failed for %s: %s", url, exc)
+        return None
+
+
+def _fetch_via_playwright(url: str, timeout_ms: int = 30000) -> tuple[bool, str, str] | None:
+    """Render a page with a headless Chromium browser via Playwright.
+
+    Last-resort fallback for pages that require full JavaScript execution and
+    cannot be handled by urllib (static HTTP) or Firecrawl (managed headless).
+    Requires ``playwright`` to be installed and browsers to be downloaded:
+    ``uv add playwright && playwright install chromium``.
+
+    Args:
+        url: The URL to render.
+        timeout_ms: Navigation timeout in milliseconds. Default: 30000.
+
+    Returns:
+        ``(True, text_snippet, "Playwright")`` on success, or ``None`` when
+        Playwright is not installed or navigation fails.
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+    except ImportError:
+        logger.debug("Playwright not installed — skipping Playwright fallback for %s.", url)
+        return None
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="pt-BR",
+                )
+                page = context.new_page()
+                page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                # Extract body text — cleaner than inner_html
+                text = page.evaluate(
+                    """() => {
+                        const remove = ['script','style','nav','footer','header','aside'];
+                        remove.forEach(t => document.querySelectorAll(t)
+                            .forEach(el => el.remove()));
+                        return document.body ? document.body.innerText : '';
+                    }"""
+                )
+                text = (text or "").strip()
+            finally:
+                browser.close()
+
+        if not text:
+            logger.debug("Playwright rendered empty body for %s.", url)
+            return None
+
+        logger.debug("Playwright fetch succeeded for %s (%d chars).", url, len(text))
+        return True, text[:3000], "Playwright"
+
+    except Exception as exc:
+        logger.debug("Playwright fetch failed for %s: %s", url, exc)
+        return None
+
+
 def _fetch_url_content(url: str, timeout: int = 15) -> tuple[bool, str, str]:
     """Fetch a URL and return (accessible, text_snippet, access_method).
 
@@ -2197,10 +2338,12 @@ def _fetch_url_content(url: str, timeout: int = 15) -> tuple[bool, str, str]:
     0. For Semantic Scholar / DOI / arXiv URLs: use the S2 Graph API to obtain
        the paper abstract — avoids bot-blocking on journal landing pages.
     1. Direct HTTP fetch with retry on 429 (up to 2 retries, 5 s wait each).
+       On HTTP error or exception: try Firecrawl before giving up.
     2. If the response is a PDF (Content-Type or .pdf URL), extract text via
        PyMuPDF instead of returning an empty snippet.
     3. If the HTML page contains PDF/download links, follow the first one that
        yields extractable PDF content — marked as "PDF_fallback".
+    4. If the HTTP fetch returns empty bytes: try Firecrawl before returning False.
 
     Args:
         url: The URL to fetch.
@@ -2210,7 +2353,7 @@ def _fetch_url_content(url: str, timeout: int = 15) -> tuple[bool, str, str]:
         Tuple of (accessible, text_snippet, access_method).
         ``accessible`` — True when any 2xx response was obtained.
         ``text_snippet`` — up to 3000 chars of body text (may be empty).
-        ``access_method`` — "HTTP" | "PDF_direto" | "PDF_fallback".
+        ``access_method`` — "HTTP" | "PDF_direto" | "PDF_fallback" | "Firecrawl".
     """
     import time
     import urllib.error
@@ -2269,12 +2412,39 @@ def _fetch_url_content(url: str, timeout: int = 15) -> tuple[bool, str, str]:
                 time.sleep(wait)
                 continue
             logger.debug("HTTP error fetching %s: %s", url, exc)
+            tv = _fetch_via_tavily(url)
+            if tv is not None:
+                return tv
+            fc = _fetch_via_firecrawl(url)
+            if fc is not None:
+                return fc
+            pw = _fetch_via_playwright(url)
+            if pw is not None:
+                return pw
             return False, "", "HTTP"
         except Exception as exc:
             logger.debug("Failed to fetch %s: %s", url, exc)
+            tv = _fetch_via_tavily(url)
+            if tv is not None:
+                return tv
+            fc = _fetch_via_firecrawl(url)
+            if fc is not None:
+                return fc
+            pw = _fetch_via_playwright(url)
+            if pw is not None:
+                return pw
             return False, "", "HTTP"
 
     if not raw_bytes:
+        tv = _fetch_via_tavily(url)
+        if tv is not None:
+            return tv
+        fc = _fetch_via_firecrawl(url)
+        if fc is not None:
+            return fc
+        pw = _fetch_via_playwright(url)
+        if pw is not None:
+            return pw
         return False, "", "HTTP"
 
     # ── PDF: direct URL or PDF Content-Type ──────────────────────────────────
@@ -2312,6 +2482,29 @@ def _fetch_url_content(url: str, timeout: int = 15) -> tuple[bool, str, str]:
         except Exception as exc:
             logger.debug("PDF fallback failed for %s → %s: %s", url, pdf_url, exc)
             continue
+
+    # If the snippet looks like a JS-only SPA shell (< 300 meaningful chars after
+    # stripping tags), escalate through Tavily → Firecrawl → Playwright before
+    # returning the near-empty shell as the verified content.
+    import re as _re_snap
+    _visible = _re_snap.sub(r"<[^>]+>", " ", snippet)
+    _visible = _re_snap.sub(r"\s{2,}", " ", _visible).strip()
+    if len(_visible) < 300:
+        logger.debug(
+            "_fetch_url_content: near-empty HTML for %s (%d visible chars) — "
+            "trying Tavily/Firecrawl/Playwright.",
+            url,
+            len(_visible),
+        )
+        tv = _fetch_via_tavily(url)
+        if tv is not None:
+            return tv
+        fc = _fetch_via_firecrawl(url)
+        if fc is not None:
+            return fc
+        pw = _fetch_via_playwright(url)
+        if pw is not None:
+            return pw
 
     return True, snippet, "HTTP"
 
@@ -2408,7 +2601,9 @@ def _literature_review_to_docx(review_doc: dict[str, Any]) -> bytes:
 
             # Access method badge (shown when raw PDF/HTTP fallback was used instead of an API)
             access_method = v_info.get("access_method", "HTTP")
-            _api_methods = {"HTTP", "Semantic_Scholar_API"}
+            # Methods that do NOT show the "Acesso direto (sem API)" badge.
+            # Playwright is browser automation (not an API) — badge shown.
+            _api_methods = {"HTTP", "Semantic_Scholar_API", "Firecrawl", "Tavily"}
             if access_method and access_method not in _api_methods:
                 badge_run = para.add_run(f"  [Acesso direto (sem API) — {access_method}]")
                 badge_run.font.size = Pt(8)

@@ -130,13 +130,22 @@ class ContentSummarizerSkill(BaseSkill):
 
     @staticmethod
     def _fetch_text(url: str, timeout: int = 10) -> str:
-        """Fetch plain text from *url* using BeautifulSoup for proper HTML parsing.
+        """Fetch plain text from *url* using a multi-tier fallback chain.
 
-        Removes script, style, nav and footer elements before extracting text
-        to avoid JavaScript, CSS, and navigation noise in the summarised content.
-        Returns empty string on any failure.
+        Fallback order:
+        1. ``urllib.request`` + BeautifulSoup (fast, no API key needed).
+        2. Firecrawl (headless-browser scraper — resolves JS SPAs and
+           bot-blocked sites such as Semantic Scholar and McKinsey).
+        3. Playwright (self-hosted headless Chromium — last resort when
+           Firecrawl is not configured or also fails).
+
+        Returns empty string only when all three methods fail.
         """
+        import re
         import urllib.request
+
+        # ── Tier 1: direct HTTP + BeautifulSoup ──────────────────────────────
+        html = ""
         try:
             req = urllib.request.Request(
                 url,
@@ -146,20 +155,107 @@ class ContentSummarizerSkill(BaseSkill):
                 raw = resp.read(65536)
                 html = raw.decode("utf-8", errors="ignore")
         except Exception:
-            return ""
+            html = ""
 
+        if html:
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                    tag.decompose()
+                text = soup.get_text(separator=" ", strip=True)
+            except Exception:
+                text = re.sub(r"<[^>]+>", " ", html)
+                text = re.sub(r"\s{2,}", " ", text).strip()
+
+            # Accept the result only when it contains meaningful content.
+            # JS-only SPA shells produce < 300 visible chars — escalate.
+            if len(text) >= 300:
+                return text
+            logger.debug(
+                "_fetch_text: near-empty HTTP response for %s (%d chars) — escalating.",
+                url, len(text),
+            )
+
+        # ── Tier 2: Tavily extract ────────────────────────────────────────────
+        import os
+        tavily_key = os.environ.get("TAVILY_API_KEY", "")
+        if tavily_key:
+            try:
+                from tavily import TavilyClient  # type: ignore[import-untyped]
+                tv_client = TavilyClient(api_key=tavily_key)
+                tv_resp = tv_client.extract(urls=[url])
+                tv_results = tv_resp.get("results", [])
+                if tv_results:
+                    tv_text = tv_results[0].get("raw_content", "") or ""
+                    if tv_text:
+                        logger.debug(
+                            "_fetch_text: Tavily extract succeeded for %s (%d chars).",
+                            url, len(tv_text),
+                        )
+                        return tv_text[:_MAX_CONTENT_CHARS]
+            except Exception as exc:
+                logger.debug("_fetch_text: Tavily extract failed for %s: %s", url, exc)
+
+        # ── Tier 3: Firecrawl ─────────────────────────────────────────────────
+        firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "")
+        if firecrawl_key:
+            try:
+                from firecrawl import FirecrawlApp  # type: ignore[import-untyped]
+                app = FirecrawlApp(api_key=firecrawl_key)
+                # firecrawl-py ≥ 1.0 uses .scrape(); older versions used .scrape_url()
+                scrape_fn = getattr(app, "scrape", None) or getattr(app, "scrape_url")
+                result = scrape_fn(url, formats=["markdown"])
+                fc_text = ""
+                if hasattr(result, "markdown") and result.markdown:
+                    fc_text = result.markdown
+                elif isinstance(result, dict):
+                    fc_text = result.get("markdown", "") or result.get("content", "")
+                if fc_text:
+                    logger.debug(
+                        "_fetch_text: Firecrawl succeeded for %s (%d chars).", url, len(fc_text)
+                    )
+                    return fc_text[:_MAX_CONTENT_CHARS]
+            except Exception as exc:
+                logger.debug("_fetch_text: Firecrawl failed for %s: %s", url, exc)
+
+        # ── Tier 4: Playwright ────────────────────────────────────────────────
         try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                tag.decompose()
-            return soup.get_text(separator=" ", strip=True)
-        except Exception:
-            # Fallback to basic regex stripping if BeautifulSoup fails
-            import re
-            text = re.sub(r"<[^>]+>", " ", html)
-            text = re.sub(r"\s{2,}", " ", text)
-            return text.strip()
+            from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                try:
+                    context = browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"
+                        )
+                    )
+                    page = context.new_page()
+                    page.goto(url, wait_until="networkidle", timeout=30000)
+                    pw_text = page.evaluate(
+                        """() => {
+                            const remove = ['script','style','nav','footer','header','aside'];
+                            remove.forEach(t => document.querySelectorAll(t)
+                                .forEach(el => el.remove()));
+                            return document.body ? document.body.innerText : '';
+                        }"""
+                    )
+                    pw_text = (pw_text or "").strip()
+                finally:
+                    browser.close()
+            if pw_text:
+                logger.debug(
+                    "_fetch_text: Playwright succeeded for %s (%d chars).", url, len(pw_text)
+                )
+                return pw_text[:_MAX_CONTENT_CHARS]
+        except ImportError:
+            logger.debug("_fetch_text: Playwright not installed — skipping for %s.", url)
+        except Exception as exc:
+            logger.debug("_fetch_text: Playwright failed for %s: %s", url, exc)
+
+        return ""
 
     def run(self, input: SkillInput) -> SkillOutput:
         """Summarise the provided content.
