@@ -1630,6 +1630,93 @@ def _text_to_pdf_bytes(title: str, content: str) -> bytes:
         return b""
 
 
+def _save_extra_sources_as_pdfs(
+    findings: list,
+    pw: "ProjectWorkspace",
+) -> int:
+    """Save extra search findings as Extra_N.pdf files in attachments/.
+
+    Called after the execute node runs with extra_search_approved=True so that
+    sources fetched during the extra-search round are persisted for CP3 citation
+    and for future pdf_reader steps.
+
+    One PDF is written per skill-call finding from search/summarizer skills.
+    Existing Extra_*.pdf files are not overwritten — the index continues from
+    the current count.
+
+    Args:
+        findings: List of SkillOutput dicts from the current execute run.
+        pw: ProjectWorkspace whose attachments_path receives the files.
+
+    Returns:
+        Number of Extra PDFs successfully saved.
+    """
+    attachments = pw.attachments_path
+    attachments.mkdir(parents=True, exist_ok=True)
+
+    # Start index after any existing Extra files
+    existing_count = len(list(attachments.glob("Extra_*.pdf")))
+    next_idx = existing_count + 1
+    saved = 0
+
+    _SEARCH_SKILLS = {
+        "web_search", "article_search", "exa_search", "tavily_search", "content_summarizer",
+    }
+
+    for finding in findings:
+        skill = finding.get("skill_name", "")
+        if skill not in _SEARCH_SKILLS:
+            continue
+
+        result = finding.get("result") or {}
+        sources = finding.get("sources") or []
+        lines: list[str] = []
+
+        if skill == "content_summarizer":
+            src = result.get("source_url") or (sources[0] if sources else "")
+            lines.append(f"Fonte: {src}")
+            ctype = result.get("content_type", "")
+            if ctype:
+                lines.append(f"Tipo: {ctype}")
+            lines.append("")
+            lines.append(result.get("summary", ""))
+        else:
+            query = result.get("query", "")
+            if query:
+                lines.append(f"Busca: {query}")
+                lines.append("")
+            for r in result.get("results", []):
+                title = r.get("title", "")
+                url = r.get("url", "")
+                snippet = (
+                    r.get("snippet") or r.get("text") or r.get("abstract") or ""
+                )
+                if title or url:
+                    lines.append(f"{title}")
+                    if url:
+                        lines.append(url)
+                    if snippet:
+                        lines.append(snippet[:600])
+                    lines.append("")
+
+        content = "\n".join(lines).strip()
+        if not content:
+            continue
+
+        pdf_bytes = _text_to_pdf_bytes(
+            title=f"Extra [{next_idx}]",
+            content=content,
+        )
+        if pdf_bytes:
+            out_path = attachments / f"Extra_{next_idx}.pdf"
+            out_path.write_bytes(pdf_bytes)
+            console.print(f"  [green]✓[/green] Fonte extra salva: Extra_{next_idx}.pdf")
+            next_idx += 1
+            saved += 1
+
+    return saved
+
+
 def _download_references_to_attachments(
     review_doc: dict,
     pw: "ProjectWorkspace",
@@ -1860,16 +1947,29 @@ _NODE_LABELS: dict[str, str] = {
     "review_literature":   "Processando revisão da literatura",
     "recheck_sources":     "Rechecando fontes via API",
     "refine_literature":   "Refinando com base nas correções",
-    # CP3 — Research Design
-    "cp3_router":       "Iniciando Research Design",
-    "compile_design":   "Compilando Research Design",
-    "deliver_design":   "Gerando documento preview",
-    "review_design":    "Processando revisão do design",
-    "refine_design":    "Refinando com base nas correções",
+    # CP3 — Research Design (4-phase pipeline)
+    "cp3_router":           "Iniciando Research Design",
+    "read_attachments":     "Lendo PDFs de referência (Fase 1)",
+    "ideate_design":        "Propondo design de pesquisa (Fase 2)",
+    "review_frameworks":    "Revisando contra referenciais OR/PMBOK/PRISMA/FAIR (Fase 3)",
+    "evaluate_objectives":  "Avaliando alinhamento com objetivos CP1 (Fase 4)",
+    "deliver_design":       "Gerando documento preview",
+    "review_design":        "Processando revisão do design",
+    "refine_design":        "Refinando com base nas correções",
+    # Legacy node kept for backward compatibility with older saved states
+    "compile_design":       "Compilando Research Design",
 }
 
+# CP3 no longer uses the plan/execute labels — the dict is kept for other stages
+_NODE_LABELS_CP3: dict[str, str] = {}
 
-def _print_node_progress(node_name: str, output: object, prev_findings_count: int = 0) -> None:
+
+def _print_node_progress(
+    node_name: str,
+    output: object,
+    prev_findings_count: int = 0,
+    stage: str = "",
+) -> None:
     """Print a user-friendly progress line for a completed node.
 
     Shows the friendly label, attempt number (for retry nodes), and
@@ -1880,8 +1980,13 @@ def _print_node_progress(node_name: str, output: object, prev_findings_count: in
         output: The node's partial state output dict.
         prev_findings_count: Number of findings in state before this node ran,
             used to compute the delta for the execute node display.
+        stage: Current pipeline stage string (e.g. "research_design"). When
+            provided, CP3-specific labels override the generic ones.
     """
-    label = _NODE_LABELS.get(node_name, node_name)
+    if stage == "research_design":
+        label = _NODE_LABELS_CP3.get(node_name) or _NODE_LABELS.get(node_name, node_name)
+    else:
+        label = _NODE_LABELS.get(node_name, node_name)
     extra = ""
 
     if isinstance(output, dict):
@@ -1895,6 +2000,24 @@ def _print_node_progress(node_name: str, output: object, prev_findings_count: in
             new_n = len(findings) - prev_findings_count
             total_n = len(findings)
             extra = f" [dim](+{new_n} novos · {total_n} no total)[/dim]"
+        elif node_name == "read_attachments" and findings is not None:
+            n = len(findings) - prev_findings_count
+            extra = f" [dim]({n} PDF(s) lido(s))[/dim]"
+        elif node_name == "ideate_design":
+            design_doc = output.get("research_design_doc") or {}
+            sections = design_doc.get("sections") or []
+            extra = f" [dim]({len(sections)} seções)[/dim]"
+        elif node_name == "review_frameworks":
+            design_doc = output.get("research_design_doc") or {}
+            sections = design_doc.get("sections") or []
+            if sections:
+                extra = f" [dim](design ajustado — {len(sections)} seções)[/dim]"
+        elif node_name == "evaluate_objectives" and evaluation:
+            score = evaluation.get("total_score", 0.0)
+            converged = evaluation.get("converged", False)
+            preserved = output.get("cp3_preserved_sections") or {}
+            flag = "[green]convergiu[/green]" if converged else "[yellow]em progresso[/yellow]"
+            extra = f" [dim](score {score:.2f} — {flag} · {len(preserved)} seções preservadas)[/dim]"
         elif node_name == "evaluate" and evaluation:
             score = evaluation.get("total_score", 0.0)
             converged = evaluation.get("converged", False)
@@ -1978,10 +2101,17 @@ def _handle_support_request(state: dict, workspace: Path) -> None:  # type: igno
             console.print(f"  [yellow]•[/yellow] {g}")
 
     console.print(f"\n[bold]Avaliação do agente:[/bold] {opinion}")
-    console.print(
-        "\n[dim]Forneça orientação para o agente replanejar as buscas.\n"
-        "Exemplos: sugerir termos, restringir período, indicar fontes específicas.[/dim]"
-    )
+    active_cp = int(state.get("active_checkpoint", 1))
+    if active_cp == 3:
+        console.print(
+            "\n[dim]Forneça orientação para o agente refinar o design de pesquisa.\n"
+            "Exemplos: ajustar método, reformular hipóteses, detalhar variáveis, reforçar ética.[/dim]"
+        )
+    else:
+        console.print(
+            "\n[dim]Forneça orientação para o agente replanejar as buscas.\n"
+            "Exemplos: sugerir termos, restringir período, indicar fontes específicas.[/dim]"
+        )
 
     guidance = typer.prompt("\nOrientação adicional").strip()
 
@@ -1991,8 +2121,13 @@ def _handle_support_request(state: dict, workspace: Path) -> None:  # type: igno
     from ai_skill.core.workspace import ResearchWorkspace  # noqa: F811
     ResearchWorkspace(workspace).save_state(state)
 
+    resume_cmd = (
+        f"ai-skill design --begin --workspace \"{workspace.parent}\""
+        if active_cp == 3
+        else f"ai-skill literature --begin --workspace \"{workspace.parent}\""
+    )
     console.print("\n[green]Orientação registrada.[/green] Retome a pesquisa com:")
-    console.print(f"  ai-skill literature --begin --workspace \"{workspace.parent}\"")
+    console.print(f"  {resume_cmd}")
 
 
 def _handle_checkpoint(
@@ -2446,6 +2581,27 @@ def begin_design(
         + (f": {topic}" if topic else "")
     )
 
+    # --- Show available PDFs (Phase 1 will read all of them) ---
+    state["extra_search_approved"] = False  # no longer used in 4-phase CP3
+    state["cp3_phase1_complete"] = False    # reset so Phase 1 runs fresh
+    state["cp3_preserved_sections"] = {}    # clear preserved sections from prior runs
+    pdfs = sorted(pw.attachments_path.glob("*.pdf")) if pw.attachments_path.is_dir() else []
+    if pdfs:
+        console.print(f"\n[bold]PDFs disponíveis em attachments/:[/bold] {len(pdfs)} arquivo(s)")
+        for p in pdfs[:6]:
+            console.print(f"  [dim]• {p.name}[/dim]")
+        if len(pdfs) > 6:
+            console.print(f"  [dim]  … e mais {len(pdfs) - 6}[/dim]")
+        console.print(
+            "\n[dim]Fase 1: todos os PDFs serão lidos como contexto para a ideação.[/dim]\n"
+            "[dim]Fase 3: buscas web sobre PMBOK/PRISMA/FAIR/ABNT/ISO são executadas automaticamente.[/dim]"
+        )
+    else:
+        console.print(
+            "\n[yellow]Nenhum PDF encontrado em attachments/.[/yellow]\n"
+            "[dim]Execute literature --signoff para baixar os PDFs do CP2 antes de iniciar o CP3.[/dim]"
+        )
+
     # --- Stream the CP3 graph ---
     graph_instance = build_cp3_graph()
     current_state: dict = dict(state)
@@ -2457,7 +2613,7 @@ def begin_design(
                     ws.save_state(current_state)
                     _handle_checkpoint(node_output, current_state, state_path)
                     return
-                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])))
+                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])), stage="research_design")
                 if isinstance(node_output, dict):
                     current_state.update(node_output)
                     ws.save_state(current_state)
@@ -2539,7 +2695,7 @@ def _design_review(workspace: Path | None) -> None:
                     ws.save_state(current_state)
                     _handle_checkpoint(node_output, current_state, state_path)
                     return
-                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])))
+                _print_node_progress(node_name, node_output, len(current_state.get("findings", [])), stage="research_design")
                 if isinstance(node_output, dict):
                     current_state.update(node_output)
                     ws.save_state(current_state)

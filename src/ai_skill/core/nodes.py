@@ -52,6 +52,9 @@ from ai_skill.prompts.evaluation import build_evaluation_messages
 from ai_skill.prompts.design import (
     build_compile_design_messages,
     build_refine_design_messages,
+    build_ideate_design_messages,
+    build_review_frameworks_messages,
+    build_evaluate_objectives_messages,
 )
 from ai_skill.prompts.literature import (
     build_compile_messages,
@@ -507,14 +510,42 @@ def plan(state: ResearchState, registry: SkillRegistry | None = None, llm: LLMCl
             defaults = _default_stage_guidelines(stage_str)
             stage_guidelines = defaults if defaults else None
 
+    # CP3 uses only the PDFs already downloaded during CP2 — no new searches.
+    # extra_search_approved=True is set by request_support when the user
+    # authorises fetching additional sources after a convergence failure.
+    available_files: list[str] = []
+    if stage_str == PipelineStage.RESEARCH_DESIGN.value:
+        extra_search_approved: bool = bool(state.get("extra_search_approved"))
+        if extra_search_approved:
+            # User approved additional searches — expose all skills
+            skill_registry_summary = _registry.all_as_dicts()
+        else:
+            # Restrict to skills that read already-downloaded material
+            _CP3_SKILLS = {"pdf_reader", "content_summarizer", "google_drive"}
+            skill_registry_summary = [
+                s for s in _registry.all_as_dicts() if s.get("name") in _CP3_SKILLS
+            ]
+        # List PDFs available in attachments/ so the LLM generates correct file_path params
+        ws_path = Path(state.get("workspace_path", ""))
+        attachments_dir = (
+            ws_path.parent / "attachments"
+            if ws_path.name == ".state"
+            else ws_path / "attachments"
+        )
+        if attachments_dir.is_dir():
+            available_files = sorted(str(f) for f in attachments_dir.glob("*.pdf"))
+    else:
+        skill_registry_summary = _registry.all_as_dicts()
+
     system, messages = build_planning_messages(
         objective=objective,
         stage=stage_str,
         attempt=attempt,
         gaps=gaps,
-        skill_registry_summary=_registry.all_as_dicts(),
+        skill_registry_summary=skill_registry_summary,
         user_guidance=user_guidance,
         stage_guidelines=stage_guidelines,
+        available_files=available_files or None,
     )
 
     try:
@@ -1421,12 +1452,13 @@ def route_cp3_start(state: ResearchState) -> str:
         state: Current ResearchState.
 
     Returns:
-        ``"refine_design"`` when a design doc and user feedback already exist;
-        ``"plan"`` otherwise.
+        ``"refine_design"`` when a design doc and user feedback already exist
+        (researcher correction cycle); ``"read_attachments"`` otherwise
+        (fresh CP3 run — Phase 1 starts).
     """
     if state.get("research_design_doc") and state.get("user_feedback"):
         return "refine_design"
-    return "plan"
+    return "read_attachments"
 
 
 def compile_design(
@@ -1760,6 +1792,479 @@ def route_after_evaluate_cp3(state: ResearchState) -> str:
     if attempt >= max_retries:
         return "request_support"
     return "plan"
+
+
+# ---------------------------------------------------------------------------
+# CP3 4-phase nodes
+# ---------------------------------------------------------------------------
+
+
+def read_attachments(
+    state: ResearchState,
+    registry: SkillRegistry | None = None,
+) -> dict[str, Any]:
+    """Phase 1 of CP3: read all PDFs from attachments/ using pdf_reader.
+
+    Runs exactly once per CP3 session (guarded by cp3_phase1_complete).
+    No planner is involved — every PDF in attachments/ is read unconditionally.
+    Results are stored in findings/findings_current for use by later phases.
+
+    Args:
+        state: Current ResearchState.
+        registry: Optional injected SkillRegistry (for testing).
+
+    Returns:
+        Partial state with pdf findings, cp3_phase1_complete=True.
+    """
+    _configure_history(state, "read_attachments")
+    _registry = registry or _get_default_registry()
+    workspace_path = state.get("workspace_path", "")
+    ws = Path(workspace_path)
+    attachments_dir = (
+        ws.parent / "attachments" if ws.name == ".state" else ws / "attachments"
+    )
+
+    pdfs: list[Path] = sorted(attachments_dir.glob("*.pdf")) if attachments_dir.is_dir() else []
+    if not pdfs:
+        logger.warning("read_attachments: no PDFs found in %s", attachments_dir)
+
+    objective = state.get("objective")
+    skill = _registry.get("pdf_reader")
+    findings_current: list[SkillOutput] = []
+
+    for pdf_path in pdfs:
+        if skill is None:
+            break
+        skill_input = SkillInput({
+            "parameters": {"file_path": str(pdf_path), "_skill_name": "pdf_reader"},
+            "objective": objective,
+            "stage": PipelineStage.RESEARCH_DESIGN.value,
+            "attempt": 0,
+        })
+        output = skill.run(skill_input)
+        findings_current.append(output)
+        _history.log_skill_call(
+            skill="pdf_reader",
+            stage=PipelineStage.RESEARCH_DESIGN.value,
+            attempt=0,
+            step_id=-1,
+            step_rationale=f"Phase 1: read {pdf_path.name}",
+            request_sent={"file_path": str(pdf_path)},
+            response_received={
+                "confidence": output.get("confidence", 0.0),
+                "error": output.get("error"),
+                "result_keys": list(output.get("result", {}).keys()),
+            },
+        )
+
+    existing = state.get("findings", [])
+    return {
+        "findings": existing + findings_current,
+        "findings_current": findings_current,
+        "cp3_phase1_complete": True,
+        "status": ResearchStatus.EXECUTING,
+    }
+
+
+def ideate_design(
+    state: ResearchState,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Phase 2 of CP3: propose the full Research Design document.
+
+    Uses CP1 charter + CP2 literature review + Phase 1 PDF context to generate
+    an original research design proposal. On retry iterations, preserved sections
+    (score >= 0.85) are injected verbatim and gaps from the previous evaluation
+    are addressed.
+
+    Args:
+        state: Current ResearchState.
+        llm: Optional LLMClient override.
+
+    Returns:
+        Partial state with research_design_doc (draft), status=EVALUATING.
+    """
+    _configure_history(state, "ideate_design")
+    _llm = llm or LLMClient()
+
+    charter_text = state.get("charter_document_text") or ""
+    cp3_context = state.get("cp3_context") or {}
+
+    literature_text = cp3_context.get("literature_summary") or ""
+    if not literature_text:
+        review_doc = state.get("literature_review_doc") or {}
+        sections = review_doc.get("sections", [])
+        literature_text = "\n\n".join(
+            f"## {s.get('section_title', '')}\n{s.get('content', '')}"
+            for s in sections
+        )
+
+    # Build compact PDF context from Phase 1 findings
+    all_findings = state.get("findings", [])
+    pdf_context: list[dict[str, Any]] = []
+    for f in all_findings:
+        if f.get("skill_name") != "pdf_reader":
+            continue
+        result = f.get("result") or {}
+        pdf_context.append({
+            "file": result.get("file_path", ""),
+            "title": result.get("title", ""),
+            "pages": result.get("num_pages", 0),
+            "text_excerpt": (result.get("text") or "")[:1500],
+        })
+
+    preserved_sections: dict[str, Any] = state.get("cp3_preserved_sections") or {}
+    evaluation = state.get("evaluation")
+    gaps: list[str] = evaluation.get("gaps", []) if evaluation else []
+
+    system, messages = build_ideate_design_messages(
+        charter_document_text=charter_text,
+        literature_document_text=literature_text,
+        cp3_context=cp3_context,
+        pdf_context=pdf_context,
+        preserved_sections=preserved_sections,
+        gaps=gaps,
+    )
+
+    try:
+        design_obj: _ResearchDesignDocLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_ResearchDesignDocLLM,
+            system=system,
+            max_tokens=16384,
+        )
+    except LLMClientError as exc:
+        logger.error("ideate_design failed: %s", exc)
+        return {"status": ResearchStatus.FAILED}
+
+    sections: list[ResearchDesignSection] = [
+        ResearchDesignSection(section_title=s.section_title, content=s.content)
+        for s in design_obj.sections
+    ]
+    design_doc = ResearchDesignDoc(
+        sections=sections,
+        study_type=design_obj.study_type,
+        research_paradigm=design_obj.research_paradigm,
+        epistemological_stance=design_obj.epistemological_stance,
+        hypotheses=design_obj.hypotheses,
+        research_questions=design_obj.research_questions,
+        variables=[v.model_dump() for v in design_obj.variables],
+        instruments=design_obj.instruments,
+        sampling_strategy=design_obj.sampling_strategy,
+        sample_size_justification=design_obj.sample_size_justification,
+        ethical_considerations=design_obj.ethical_considerations,
+        validity_threats=design_obj.validity_threats,
+        mitigation_strategies=[m.model_dump() for m in design_obj.mitigation_strategies],
+        data_management_plan=design_obj.data_management_plan,
+        metrics_and_kpis=design_obj.metrics_and_kpis,
+        data_sources=design_obj.data_sources,
+        collection_protocol=design_obj.collection_protocol,
+        methodology_timeline=design_obj.methodology_timeline,
+        reporting_standard=design_obj.reporting_standard,
+        target_journal_tier=design_obj.target_journal_tier,
+    )
+
+    return {
+        "research_design_doc": design_doc,
+        "status": ResearchStatus.EVALUATING,
+    }
+
+
+def review_frameworks(
+    state: ResearchState,
+    registry: SkillRegistry | None = None,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Phase 3 of CP3: critique and adjust the design against formal standards.
+
+    Searches the web for PRISMA-trAIce 2025 and other standard specifics, then
+    calls the LLM to review the design against OR, PMBOK, PRISMA, PRISMA-trAIce
+    2025, FAIR, SJR, ABNT NBR, and ISO 9001:2015. Targeted corrections are
+    applied to produce an improved design document.
+
+    Web searches for methodology standards require no user authorization.
+
+    Args:
+        state: Current ResearchState with research_design_doc from Phase 2.
+        registry: Optional injected SkillRegistry (for testing).
+        llm: Optional LLMClient override.
+
+    Returns:
+        Partial state with (possibly corrected) research_design_doc.
+    """
+    _configure_history(state, "review_frameworks")
+    _registry = registry or _get_default_registry()
+    _llm = llm or LLMClient()
+
+    design_doc = state.get("research_design_doc")
+    if not design_doc:
+        logger.warning("review_frameworks: no research_design_doc — skipping.")
+        return {}
+
+    objective = state.get("cp3_context") or state.get("objective") or {}
+    charter_summary = (
+        f"Tópico: {objective.get('topic', '')}\n"
+        f"Objetivos: {'; '.join(objective.get('goals') or [])}"
+    )
+
+    # Web searches for standards (always allowed in Phase 3)
+    web_skill = _registry.get("web_search")
+    search_snippets: list[str] = []
+    prisma_traice_context = ""
+
+    _framework_queries = [
+        ("PRISMA-trAIce 2025 checklist AI research reporting", "en"),
+        ("PRISMA-trAIce 2025 guidelines LLM studies", "en"),
+        ("FAIR data principles research design compliance checklist", "en"),
+        ("SJR Q1 Q2 methodology requirements academic research", "en"),
+    ]
+
+    if web_skill is not None:
+        for query, lang in _framework_queries:
+            skill_input = SkillInput({
+                "parameters": {
+                    "query": query,
+                    "max_results": 5,
+                    "language": lang,
+                    "_skill_name": "web_search",
+                },
+                "objective": state.get("objective"),
+                "stage": PipelineStage.RESEARCH_DESIGN.value,
+                "attempt": state.get("attempt", 0),
+            })
+            out = web_skill.run(skill_input)
+            if not out.get("error"):
+                results = (out.get("result") or {}).get("results", [])
+                for r in results[:3]:
+                    snippet = r.get("snippet") or r.get("description") or ""
+                    title = r.get("title") or ""
+                    if snippet:
+                        search_snippets.append(f"[{title}] {snippet}")
+                        if "trAIce" in title or "trAIce" in snippet:
+                            prisma_traice_context += f"\n{snippet}"
+
+    framework_search_results = "\n".join(search_snippets) if search_snippets else ""
+
+    system, messages = build_review_frameworks_messages(
+        design_doc=dict(design_doc),
+        charter_summary=charter_summary,
+        framework_search_results=framework_search_results,
+        prisma_traice_context=prisma_traice_context.strip(),
+    )
+
+    try:
+        revised_obj: _ResearchDesignDocLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_ResearchDesignDocLLM,
+            system=system,
+            max_tokens=16384,
+        )
+    except LLMClientError as exc:
+        logger.error("review_frameworks failed: %s — keeping Phase 2 draft", exc)
+        return {}
+
+    sections: list[ResearchDesignSection] = [
+        ResearchDesignSection(section_title=s.section_title, content=s.content)
+        for s in revised_obj.sections
+    ]
+    revised_doc = ResearchDesignDoc(
+        sections=sections,
+        study_type=revised_obj.study_type,
+        research_paradigm=revised_obj.research_paradigm,
+        epistemological_stance=revised_obj.epistemological_stance,
+        hypotheses=revised_obj.hypotheses,
+        research_questions=revised_obj.research_questions,
+        variables=[v.model_dump() for v in revised_obj.variables],
+        instruments=revised_obj.instruments,
+        sampling_strategy=revised_obj.sampling_strategy,
+        sample_size_justification=revised_obj.sample_size_justification,
+        ethical_considerations=revised_obj.ethical_considerations,
+        validity_threats=revised_obj.validity_threats,
+        mitigation_strategies=[m.model_dump() for m in revised_obj.mitigation_strategies],
+        data_management_plan=revised_obj.data_management_plan,
+        metrics_and_kpis=revised_obj.metrics_and_kpis,
+        data_sources=revised_obj.data_sources,
+        collection_protocol=revised_obj.collection_protocol,
+        methodology_timeline=revised_obj.methodology_timeline,
+        reporting_standard=revised_obj.reporting_standard,
+        target_journal_tier=revised_obj.target_journal_tier,
+    )
+    return {"research_design_doc": revised_doc}
+
+
+class _SectionScoreLLM(BaseModel):
+    """Score for a single design section."""
+
+    section_title: str = Field(description="Title of the section being scored.")
+    score: float = Field(description="Quality score 0.0–1.0.", ge=0.0, le=1.0)
+    rationale: str = Field(description="One-sentence justification for the score.")
+    gaps: list[str] = Field(
+        default_factory=list,
+        description="Specific gaps vs. CP1 objectives (empty when score >= 0.85).",
+    )
+
+
+class _EvaluateObjectivesLLM(BaseModel):
+    """Per-section scores and aggregated gaps from evaluate_objectives."""
+
+    sections: list[_SectionScoreLLM] = Field(
+        description="One score entry per mandatory design section."
+    )
+    gaps: list[str] = Field(
+        description="Aggregated list of gaps across all sections with score < 0.85."
+    )
+
+
+def evaluate_objectives(
+    state: ResearchState,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Phase 4 of CP3: evaluate the design document against CP1 research objectives.
+
+    Scores each of the 9 mandatory sections individually against the research
+    objectives from CP1. Sections scoring >= 0.85 are preserved verbatim in
+    subsequent ideate_design calls. Computes total_score as the mean of section
+    scores and sets converged = total_score >= _CONVERGENCE_THRESHOLD.
+
+    Args:
+        state: Current ResearchState with research_design_doc from Phase 3.
+        llm: Optional LLMClient override.
+
+    Returns:
+        Partial state with evaluation, cp3_preserved_sections, attempt+1,
+        and quality_history snapshot.
+    """
+    _configure_history(state, "evaluate_objectives")
+    _llm = llm or LLMClient()
+
+    design_doc = state.get("research_design_doc")
+    if not design_doc:
+        logger.warning("evaluate_objectives: no research_design_doc — failing.")
+        return {
+            "evaluation": EvaluationResult(
+                per_metric=[], total_score=0.0, converged=False,
+                gaps=["research_design_doc ausente"], regression=False,
+            ),
+            "attempt": state.get("attempt", 0) + 1,
+        }
+
+    objective = state.get("cp3_context") or state.get("objective") or {}
+    attempt = state.get("attempt", 0)
+    quality_history = state.get("quality_history", [])
+    stage_str = PipelineStage.RESEARCH_DESIGN.value
+
+    system, messages = build_evaluate_objectives_messages(
+        objective=objective,
+        design_doc=dict(design_doc),
+        threshold=_CONVERGENCE_THRESHOLD,
+    )
+
+    try:
+        eval_obj: _EvaluateObjectivesLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_EvaluateObjectivesLLM,
+            system=system,
+        )
+    except LLMClientError as exc:
+        logger.error("evaluate_objectives failed: %s", exc)
+        eval_obj = _EvaluateObjectivesLLM(
+            sections=[],
+            gaps=[f"Evaluation error: {exc}"],
+        )
+
+    # Compute total_score deterministically
+    scores = [s.score for s in eval_obj.sections]
+    total_score = sum(scores) / len(scores) if scores else 0.0
+    converged = total_score >= _CONVERGENCE_THRESHOLD
+
+    # Regression detection
+    previous_score = quality_history[-1]["total_score"] if quality_history else None
+    regression = (
+        previous_score is not None and (previous_score - total_score) > 0.05
+    )
+
+    per_metric: list[MetricScore] = [
+        MetricScore(
+            metric=s.section_title,
+            score=s.score,
+            rationale=s.rationale,
+            gaps=s.gaps,
+        )
+        for s in eval_obj.sections
+    ]
+
+    evaluation = EvaluationResult(
+        per_metric=per_metric,
+        total_score=total_score,
+        converged=converged,
+        gaps=eval_obj.gaps,
+        regression=regression,
+    )
+
+    # Preserve sections that scored >= 0.85 for the next ideation iteration
+    design_sections: list[dict[str, Any]] = (design_doc.get("sections") or [])
+    section_content_by_title: dict[str, str] = {
+        s.get("section_title", ""): s.get("content", "")
+        for s in design_sections
+    }
+    preserved: dict[str, Any] = {}
+    for s in eval_obj.sections:
+        if s.score >= 0.85:
+            content = section_content_by_title.get(s.section_title, "")
+            if content:
+                preserved[s.section_title] = {"content": content, "score": s.score}
+
+    snapshot = QualitySnapshot(
+        attempt=attempt,
+        stage=stage_str,
+        total_score=total_score,
+        per_metric_scores={s.section_title: s.score for s in eval_obj.sections},
+        skills_used=["ideate_design", "review_frameworks"],
+        cache_hit_rate=0.0,
+    )
+
+    new_quality_history = list(quality_history) + [snapshot]
+    stage_quality_history = dict(state.get("stage_quality_history") or {})
+    stage_quality_history.setdefault(stage_str, [])
+    stage_quality_history[stage_str] = list(stage_quality_history[stage_str]) + [snapshot]
+
+    if regression:
+        logger.warning(
+            "Quality regression in CP3: %.2f → %.2f (attempt %d)",
+            previous_score, total_score, attempt,
+        )
+
+    return {
+        "evaluation": evaluation,
+        "cp3_preserved_sections": preserved,
+        "attempt": attempt + 1,
+        "quality_history": new_quality_history,
+        "stage_quality_history": stage_quality_history,
+        "status": ResearchStatus.PLANNING,
+    }
+
+
+def route_after_evaluate_objectives(state: ResearchState) -> str:
+    """Conditional edge after evaluate_objectives in CP3.
+
+    Routes to deliver_design on convergence, ideate_design for retry,
+    or request_support when max retries are exhausted.
+
+    Args:
+        state: Current ResearchState with evaluation result.
+
+    Returns:
+        Name of the next node.
+    """
+    evaluation = state.get("evaluation")
+    attempt = state.get("attempt", 0)
+    max_retries = int(os.environ.get("AI_SKILL_MAX_RETRIES", "5"))
+
+    if evaluation and evaluation.get("converged"):
+        return "deliver_design"
+    if attempt >= max_retries:
+        return "request_support"
+    return "ideate_design"
 
 
 # ---------------------------------------------------------------------------

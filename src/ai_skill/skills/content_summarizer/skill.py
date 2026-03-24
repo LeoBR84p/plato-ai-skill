@@ -132,16 +132,61 @@ class ContentSummarizerSkill(BaseSkill):
     def _fetch_text(url: str, timeout: int = 10) -> str:
         """Fetch plain text from *url* using a multi-tier fallback chain.
 
-        Fallback order:
-        1. ``urllib.request`` + BeautifulSoup (fast, no API key needed).
-        2. Firecrawl (headless-browser scraper — resolves JS SPAs and
-           bot-blocked sites such as Semantic Scholar and McKinsey).
-        3. Playwright (self-hosted headless Chromium — last resort when
-           Firecrawl is not configured or also fails).
+        Handles both HTTP(S) URLs and local file paths. Local PDF paths are
+        extracted via PyMuPDF (or pypdf fallback) rather than being read as
+        raw bytes — which would produce unreadable binary content.
 
-        Returns empty string only when all three methods fail.
+        Fallback order for HTTP URLs:
+        1. ``urllib.request`` + BeautifulSoup (fast, no API key needed).
+        2. Tavily extract (bypasses bot-blocking; no headless browser).
+        3. Firecrawl (headless-browser scraper — resolves JS SPAs).
+        4. Playwright (self-hosted headless Chromium — last resort).
+
+        Returns empty string only when all methods fail.
         """
         import re
+        from pathlib import Path
+
+        # ── Local file path: extract text directly ────────────────────────────
+        # Guard against urllib silently reading binary PDF bytes as UTF-8.
+        is_local = url and not url.startswith(("http://", "https://"))
+        if is_local:
+            local_path = Path(url)
+            if not local_path.exists():
+                logger.debug("_fetch_text: local path not found: %s", url)
+                return ""
+            if local_path.suffix.lower() == ".pdf":
+                try:
+                    import pymupdf as _fitz  # PyMuPDF ≥ 1.24
+                except ImportError:
+                    try:
+                        import fitz as _fitz  # type: ignore[no-redef]
+                    except ImportError:
+                        _fitz = None  # type: ignore[assignment]
+                if _fitz is not None:
+                    try:
+                        doc = _fitz.open(str(local_path))
+                        parts = [doc[i].get_text(sort=True) for i in range(min(len(doc), 30))]
+                        doc.close()
+                        return "\n\n".join(parts)[:_MAX_CONTENT_CHARS]
+                    except Exception as exc:
+                        logger.debug("_fetch_text: PyMuPDF failed for %s: %s", url, exc)
+                # pypdf fallback
+                try:
+                    import pypdf as _pypdf
+                    with open(local_path, "rb") as _f:
+                        _reader = _pypdf.PdfReader(_f)
+                        parts = [p.extract_text() or "" for p in _reader.pages[:30]]
+                    return "\n\n".join(parts)[:_MAX_CONTENT_CHARS]
+                except Exception as exc:
+                    logger.debug("_fetch_text: pypdf fallback failed for %s: %s", url, exc)
+            else:
+                try:
+                    return local_path.read_text(encoding="utf-8", errors="ignore")[:_MAX_CONTENT_CHARS]
+                except Exception as exc:
+                    logger.debug("_fetch_text: text file read failed for %s: %s", url, exc)
+            return ""
+
         import urllib.request
 
         # ── Tier 1: direct HTTP + BeautifulSoup ──────────────────────────────

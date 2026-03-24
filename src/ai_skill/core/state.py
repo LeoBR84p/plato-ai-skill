@@ -349,6 +349,20 @@ class ResearchState(TypedDict, total=False):
     document_version: int
     workspace_path: str
 
+    # CP3: extra search authorization
+    # Set to True by _handle_support_request when the user approves additional
+    # web searches after CP3 fails to converge using only the CP2 PDFs.
+    extra_search_approved: bool
+
+    # CP3 4-phase pipeline state
+    # cp3_phase1_complete: True after read_attachments runs; prevents re-reading
+    #   on retry iterations within the same graph execution.
+    # cp3_preserved_sections: sections that scored >= 0.85 in evaluate_objectives
+    #   and must be carried verbatim into the next ideate_design call.
+    #   Keys are section_title strings; values are dicts with 'content' and 'score'.
+    cp3_phase1_complete: bool
+    cp3_preserved_sections: dict  # section_title → {"content": str, "score": float}
+
     # LangGraph message history (uses add_messages reducer)
     messages: Annotated[list[BaseMessage], add_messages]
 

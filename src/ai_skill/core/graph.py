@@ -25,21 +25,25 @@ CP2 Graph topology (Literature Review):
                                                         → deliver_literature
                                                         → [interrupt again]
 
-CP3 Graph topology (Research Design):
+CP3 Graph topology (Research Design — 4-phase pipeline):
 
-    START → cp3_router ──┬── (fresh)       → plan → execute → evaluate
+    START → cp3_router ──┬── (fresh)       → read_attachments (Phase 1, once)
                          └── (correction)  → refine_design
 
-    evaluate ──┬── converged   → compile_design → deliver_design
-               ├── attempt<5   → plan
-               └── attempt==5  → request_support → plan
+    Phase 1 — read_attachments: reads all PDFs in attachments/ (no planner, no retry)
+    Phase 2 — ideate_design:    proposes the full research design (CP1+CP2+PDF context)
+    Phase 3 — review_frameworks: critiques against OR/PMBOK/PRISMA/PRISMA-trAIce/FAIR/ABNT/ISO
+    Phase 4 — evaluate_objectives: scores each section against CP1 objectives
+
+    evaluate_objectives ──┬── converged   → deliver_design
+                          ├── attempt<5   → ideate_design  (retry; preserved sections carried over)
+                          └── attempt==5  → request_support → ideate_design
 
     deliver_design → [interrupt_before review_design — CHECKPOINT 3]
 
     review_design ──┬── design_approved=True  → END
                     └── design_approved=False → refine_design
-                                               → deliver_design
-                                               → [interrupt again]
+                                               → deliver_design → [interrupt again]
 
 Checkpoints (interrupt_before) pause the graph, persist state, and wait
 for a human response before the next node executes.
@@ -53,25 +57,28 @@ from langgraph.graph import END, START, StateGraph
 
 from ai_skill.core.nodes import (
     align_charter,
-    compile_design,
     compile_literature,
     cp2_router,
     cp3_router,
     deliver_design,
     deliver_literature,
     evaluate,
+    evaluate_objectives,
     execute,
+    ideate_design,
     initiate,
     plan,
+    read_attachments,
     recheck_sources,
     refine_design,
     refine_literature,
     request_support,
     review_charter,
     review_design,
+    review_frameworks,
     review_literature,
     route_after_evaluate,
-    route_after_evaluate_cp3,
+    route_after_evaluate_objectives,
     route_after_review_charter,
     route_after_review_design,
     route_after_review_literature,
@@ -178,51 +185,57 @@ def build_cp2_graph() -> "CompiledGraph":  # type: ignore[name-defined]
 def build_cp3_graph() -> "CompiledGraph":  # type: ignore[name-defined]
     """Build and compile the Checkpoint 3 (Research Design) graph.
 
-    Flow:
-        START → cp3_router ──┬── plan (fresh start)
-                             └── refine_design (correction cycle)
-        plan → execute → evaluate → compile_design → deliver_design
-             → [interrupt] → review_design
-             → END (approve) | refine_design (corrections loop)
+    4-phase pipeline:
+        Phase 1 — read_attachments: reads all PDFs in attachments/ (once, no retry)
+        Phase 2 — ideate_design:    proposes the full design from CP1+CP2+PDF context
+        Phase 3 — review_frameworks: critiques against OR/PMBOK/PRISMA/FAIR/ABNT/ISO
+        Phase 4 — evaluate_objectives: scores each section against CP1 objectives
+
+    Loop: on non-convergence, evaluate_objectives → ideate_design (preserving
+    high-scoring sections). After max retries: request_support → ideate_design.
+    Researcher correction cycle: cp3_router → refine_design.
 
     Returns:
         Compiled LangGraph StateGraph for CP3.
     """
     builder: StateGraph = StateGraph(ResearchState)
 
-    builder.add_node("cp3_router",      cp3_router)
-    builder.add_node("plan",            plan)
-    builder.add_node("execute",         execute)
-    builder.add_node("evaluate",        evaluate)
-    builder.add_node("request_support", request_support)
-    builder.add_node("compile_design",  compile_design)
-    builder.add_node("deliver_design",  deliver_design)
-    builder.add_node("review_design",   review_design)
-    builder.add_node("refine_design",   refine_design)
+    builder.add_node("cp3_router",           cp3_router)
+    builder.add_node("read_attachments",     read_attachments)
+    builder.add_node("ideate_design",        ideate_design)
+    builder.add_node("review_frameworks",    review_frameworks)
+    builder.add_node("evaluate_objectives",  evaluate_objectives)
+    builder.add_node("request_support",      request_support)
+    builder.add_node("deliver_design",       deliver_design)
+    builder.add_node("review_design",        review_design)
+    builder.add_node("refine_design",        refine_design)
 
     builder.add_edge(START, "cp3_router")
     builder.add_conditional_edges(
         "cp3_router",
         route_cp3_start,
-        {"plan": "plan", "refine_design": "refine_design"},
+        {"read_attachments": "read_attachments", "refine_design": "refine_design"},
     )
 
-    builder.add_edge("plan", "execute")
-    builder.add_edge("execute", "evaluate")
+    # Phase 1 → 2 → 3 → 4 (linear, no retry within phases)
+    builder.add_edge("read_attachments",  "ideate_design")
+    builder.add_edge("ideate_design",     "review_frameworks")
+    builder.add_edge("review_frameworks", "evaluate_objectives")
+
+    # Phase 4 routing: converged → deliver | retry → ideate | exhausted → support
     builder.add_conditional_edges(
-        "evaluate",
-        route_after_evaluate_cp3,
+        "evaluate_objectives",
+        route_after_evaluate_objectives,
         {
-            "compile_design": "compile_design",
-            "plan": "plan",
+            "deliver_design":  "deliver_design",
+            "ideate_design":   "ideate_design",
             "request_support": "request_support",
         },
     )
-    builder.add_edge("request_support", "plan")
+    builder.add_edge("request_support", "ideate_design")
 
-    builder.add_edge("compile_design", "deliver_design")
+    # Delivery and researcher review
     builder.add_edge("deliver_design", "review_design")
-
     builder.add_conditional_edges(
         "review_design",
         route_after_review_design,

@@ -60,10 +60,16 @@ Rules:
 content_summarizer — IMPORTANT:
 - Requires EITHER "content" (pre-fetched text, ≤ 300 chars) OR "source_url".
   NEVER call it without at least one of these — it will fail.
+- "source_url" MUST be an HTTP/HTTPS URL. NEVER pass a local file path as
+  "source_url" — for local PDF files use pdf_reader with "file_path" instead.
 - Prefer "source_url" so the skill fetches live content. Use "content" only
   for short abstracts passed from a preceding article_search step.
 - With URL only:  {{"source_url": "https://...", "content_type": "article", "source_year": 2023}}
 - With text:      {{"content": "<abstract ≤ 300 chars>", "source_url": "https://...", "content_type": "article"}}
+
+pdf_reader — for local PDF files in attachments/:
+- Use "file_path" with the absolute path shown in the available files list.
+- DO NOT use content_summarizer with a local path — use pdf_reader instead.
 """
 
 PLANNING_USER = """\
@@ -78,7 +84,7 @@ Diretrizes desta etapa (driver principal do plano):
 
 Lacunas da tentativa anterior (vazio na primeira tentativa):
 {gaps_json}
-
+{available_files_section}
 Produza um ExecutionPlan cujos steps endereçam diretamente as diretrizes acima.
 """
 
@@ -94,7 +100,7 @@ Diretrizes desta etapa (driver principal do plano):
 
 Lacunas da tentativa anterior:
 {gaps_json}
-
+{available_files_section}
 ORIENTAÇÃO DO PESQUISADOR (prioridade máxima):
 {user_guidance}
 
@@ -111,6 +117,7 @@ def build_planning_messages(
     skill_registry_summary: list[dict[str, Any]],
     user_guidance: str | None = None,
     stage_guidelines: list[str] | None = None,
+    available_files: list[str] | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     """Build the system prompt and messages list for the planning node.
 
@@ -128,6 +135,9 @@ def build_planning_messages(
         user_guidance: Optional researcher guidance collected after convergence failure.
         stage_guidelines: Stage-specific directives from
             ``objective["stage_guidelines"][stage]``.
+        available_files: Absolute paths to files the planner may read (e.g. PDFs
+            in attachments/). When provided, injected into the prompt so the LLM
+            can generate pdf_reader steps with the correct file_path parameters.
 
     Returns:
         Tuple of (system_prompt, messages_list).
@@ -141,6 +151,16 @@ def build_planning_messages(
 
     objective_json = json.dumps(objective_for_prompt, ensure_ascii=False, indent=2)
 
+    if available_files:
+        available_files_section = (
+            "\nArquivos disponíveis em attachments/ "
+            "(use pdf_reader com o parâmetro file_path para lê-los — NÃO use article_search nem web_search):\n"
+            + json.dumps(available_files, ensure_ascii=False, indent=2)
+            + "\n"
+        )
+    else:
+        available_files_section = ""
+
     system = PLANNING_SYSTEM.format(
         skill_registry_json=json.dumps(skill_registry_summary, ensure_ascii=False, indent=2)
     )
@@ -151,6 +171,7 @@ def build_planning_messages(
             attempt=attempt,
             stage_guidelines_json=json.dumps(effective_guidelines, ensure_ascii=False, indent=2),
             gaps_json=json.dumps(gaps, ensure_ascii=False, indent=2),
+            available_files_section=available_files_section,
             user_guidance=user_guidance,
         )
     else:
@@ -160,6 +181,7 @@ def build_planning_messages(
             attempt=attempt,
             stage_guidelines_json=json.dumps(effective_guidelines, ensure_ascii=False, indent=2),
             gaps_json=json.dumps(gaps, ensure_ascii=False, indent=2),
+            available_files_section=available_files_section,
         )
     messages = [{"role": "user", "content": user_content}]
     return system, messages
