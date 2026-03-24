@@ -52,6 +52,7 @@ from ai_skill.prompts.evaluation import build_evaluation_messages
 from ai_skill.prompts.design import (
     build_compile_design_messages,
     build_refine_design_messages,
+    build_extract_pdf_methodology_messages,
     build_ideate_design_messages,
     build_review_frameworks_messages,
     build_evaluate_objectives_messages,
@@ -62,6 +63,7 @@ from ai_skill.prompts.literature import (
     build_verify_messages,
 )
 from ai_skill.prompts.planning import build_planning_messages
+from ai_skill.core.rag import RagIndex
 from ai_skill.skills.registry import SkillRegistry
 from ai_skill.skills.base import SkillInput
 
@@ -1802,22 +1804,33 @@ def route_after_evaluate_cp3(state: ResearchState) -> str:
 def read_attachments(
     state: ResearchState,
     registry: SkillRegistry | None = None,
+    llm: LLMClient | None = None,
 ) -> dict[str, Any]:
-    """Phase 1 of CP3: read all PDFs from attachments/ using pdf_reader.
+    """Phase 1 of CP3: extract methodology-relevant content from each PDF.
 
-    Runs exactly once per CP3 session (guarded by cp3_phase1_complete).
-    No planner is involved — every PDF in attachments/ is read unconditionally.
-    Results are stored in findings/findings_current for use by later phases.
+    Processes PDFs in attachments/ one at a time using a RAG approach:
+      1. Read PDF text with pdf_reader skill.
+      2. Call LLM to extract only the methodology-relevant content.
+      3. Save the result as ``{name}.md`` beside the PDF (persistent cache).
+
+    If ``{name}.md`` already exists it is loaded directly — the PDF is not
+    re-read on retries or subsequent runs.  This keeps the context window
+    under control regardless of how many PDFs are in attachments/.
+
+    The findings list contains one SkillOutput per PDF with the .md path and
+    a short excerpt so ideate_design can reference specific files by name.
 
     Args:
         state: Current ResearchState.
         registry: Optional injected SkillRegistry (for testing).
+        llm: Optional LLMClient override (for testing).
 
     Returns:
         Partial state with pdf findings, cp3_phase1_complete=True.
     """
     _configure_history(state, "read_attachments")
     _registry = registry or _get_default_registry()
+    _llm = llm or LLMClient()
     workspace_path = state.get("workspace_path", "")
     ws = Path(workspace_path)
     attachments_dir = (
@@ -1828,34 +1841,123 @@ def read_attachments(
     if not pdfs:
         logger.warning("read_attachments: no PDFs found in %s", attachments_dir)
 
-    objective = state.get("objective")
-    skill = _registry.get("pdf_reader")
+    # Namespace-isolated BM25 index for the CP3 methodology view.
+    # Files produced: {stem}__cp3_methodology.md + .rag_index__cp3_methodology.json
+    _CP3_NAMESPACE = "cp3_methodology"
+    rag = RagIndex(attachments_dir, _CP3_NAMESPACE) if attachments_dir.is_dir() else None
+
+    pdf_skill = _registry.get("pdf_reader")
     findings_current: list[SkillOutput] = []
+    stage_str = PipelineStage.RESEARCH_DESIGN.value
 
     for pdf_path in pdfs:
-        if skill is None:
-            break
-        skill_input = SkillInput({
-            "parameters": {"file_path": str(pdf_path), "_skill_name": "pdf_reader"},
-            "objective": objective,
-            "stage": PipelineStage.RESEARCH_DESIGN.value,
-            "attempt": 0,
-        })
-        output = skill.run(skill_input)
-        findings_current.append(output)
+        md_path = rag.md_path_for(pdf_path.stem) if rag is not None else pdf_path.with_suffix(".md")
+
+        # ── Cache hit: .md already extracted for this namespace ───────────────
+        if md_path.exists():
+            try:
+                md_content = md_path.read_text(encoding="utf-8", errors="ignore")
+                # Ensure it is in the index even if created in a prior run
+                if rag is not None and not rag.contains(pdf_path.stem):
+                    rag.add(pdf_path.stem, md_content)
+                findings_current.append(SkillOutput(
+                    skill_name="read_attachments",
+                    result={
+                        "file_path": str(pdf_path),
+                        "md_path": str(md_path),
+                        "namespace": _CP3_NAMESPACE,
+                        "excerpt": md_content[:500],
+                        "cached": True,
+                    },
+                    confidence=0.8,
+                    sources=[str(pdf_path)],
+                    error=None,
+                    cached=True,
+                ))
+                logger.debug("read_attachments[%s]: cache hit for %s", _CP3_NAMESPACE, pdf_path.name)
+                continue
+            except Exception as exc:
+                logger.debug("read_attachments: cache read failed for %s: %s", md_path, exc)
+
+        # ── Step 1: extract PDF text ──────────────────────────────────────────
+        raw_text = ""
+        if pdf_skill is not None:
+            skill_input = SkillInput({
+                "parameters": {"file_path": str(pdf_path), "_skill_name": "pdf_reader"},
+                "objective": state.get("objective"),
+                "stage": stage_str,
+                "attempt": 0,
+            })
+            pdf_out = pdf_skill.run(skill_input)
+            raw_text = (pdf_out.get("result") or {}).get("text") or ""
+            if pdf_out.get("error"):
+                logger.warning(
+                    "read_attachments: pdf_reader error for %s: %s",
+                    pdf_path.name, pdf_out["error"],
+                )
+
+        if not raw_text.strip():
+            findings_current.append(SkillOutput(
+                skill_name="read_attachments",
+                result={"file_path": str(pdf_path), "error": "empty text after extraction"},
+                confidence=0.0,
+                sources=[str(pdf_path)],
+                error=f"Could not extract text from {pdf_path.name}",
+                cached=False,
+            ))
+            continue
+
+        # ── Step 2: LLM extracts methodology-relevant content ─────────────────
+        system, messages = build_extract_pdf_methodology_messages(
+            filename=pdf_path.name,
+            text=raw_text,
+        )
+        try:
+            md_content: str = _llm.complete(
+                messages=messages,
+                system=system,
+                max_tokens=1024,
+            )
+        except LLMClientError as exc:
+            logger.warning(
+                "read_attachments: LLM extraction failed for %s: %s", pdf_path.name, exc
+            )
+            md_content = f"## {pdf_path.name}\n\n*Extração automática falhou: {exc}*\n"
+
+        # ── Step 3: save namespaced .md and update index ──────────────────────
+        try:
+            md_path.write_text(md_content, encoding="utf-8")
+            logger.debug("read_attachments[%s]: saved %s", _CP3_NAMESPACE, md_path.name)
+        except Exception as exc:
+            logger.warning("read_attachments: could not save %s: %s", md_path, exc)
+
+        if rag is not None:
+            rag.add(pdf_path.stem, md_content)
+
         _history.log_skill_call(
-            skill="pdf_reader",
-            stage=PipelineStage.RESEARCH_DESIGN.value,
+            skill="read_attachments",
+            stage=stage_str,
             attempt=0,
             step_id=-1,
-            step_rationale=f"Phase 1: read {pdf_path.name}",
+            step_rationale=f"Phase 1 RAG extraction: {pdf_path.name}",
             request_sent={"file_path": str(pdf_path)},
-            response_received={
-                "confidence": output.get("confidence", 0.0),
-                "error": output.get("error"),
-                "result_keys": list(output.get("result", {}).keys()),
-            },
+            response_received={"md_path": str(md_path), "md_chars": len(md_content)},
         )
+
+        findings_current.append(SkillOutput(
+            skill_name="read_attachments",
+            result={
+                "file_path": str(pdf_path),
+                "md_path": str(md_path),
+                "namespace": _CP3_NAMESPACE,
+                "excerpt": md_content[:500],
+                "cached": False,
+            },
+            confidence=0.8,
+            sources=[str(pdf_path)],
+            error=None,
+            cached=False,
+        ))
 
     existing = state.get("findings", [])
     return {
@@ -1899,19 +2001,72 @@ def ideate_design(
             for s in sections
         )
 
-    # Build compact PDF context from Phase 1 findings
-    all_findings = state.get("findings", [])
+    # Build PDF context via BM25 retrieval (RAG).
+    # For each of the 9 mandatory CP3 sections, query the RagIndex and collect
+    # the top-3 most relevant .md excerpts.  This caps context regardless of
+    # how many PDFs exist in attachments/.
+    workspace_path_str = state.get("workspace_path", "")
+    ws_path = Path(workspace_path_str)
+    attachments_dir_for_rag = (
+        ws_path.parent / "attachments" if ws_path.name == ".state"
+        else ws_path / "attachments"
+    )
+    # Use the same namespace that read_attachments wrote into
+    _CP3_NAMESPACE = "cp3_methodology"
+    rag = (
+        RagIndex(attachments_dir_for_rag, _CP3_NAMESPACE)
+        if attachments_dir_for_rag.is_dir()
+        else None
+    )
+
+    # One query per mandatory CP3 section — captures the vocabulary each section needs
+    _SECTION_QUERIES = [
+        "research method experimental quasi-experimental observational study design type",
+        "hypothesis research question testable falsifiable H0 H1",
+        "variables independent dependent confounding operationalization measurement scale",
+        "KPI metrics acceptance threshold statistical power sample size calculation",
+        "data sources FAIR findable accessible interoperable reusable primary secondary",
+        "instruments data collection protocol questionnaire survey interview sensor",
+        "validity reliability internal external threats mitigation replication",
+        "ethics CEP IRB LGPD consent privacy conflict of interest",
+        "timeline schedule milestones PMBOK planning executing",
+    ]
+
     pdf_context: list[dict[str, Any]] = []
-    for f in all_findings:
-        if f.get("skill_name") != "pdf_reader":
-            continue
-        result = f.get("result") or {}
-        pdf_context.append({
-            "file": result.get("file_path", ""),
-            "title": result.get("title", ""),
-            "pages": result.get("num_pages", 0),
-            "text_excerpt": (result.get("text") or "")[:1500],
-        })
+    seen_in_context: set[str] = set()
+
+    if rag is not None and rag.size() > 0:
+        for query in _SECTION_QUERIES:
+            for doc_id, excerpt, score in rag.search(query, top_k=3):
+                if doc_id not in seen_in_context:
+                    seen_in_context.add(doc_id)
+                    pdf_context.append({
+                        "file": doc_id,
+                        "relevance_score": round(score, 3),
+                        "methodology_notes": excerpt,
+                    })
+    else:
+        # Fallback: read namespaced .md files from findings if index not available
+        all_findings = state.get("findings", [])
+        seen_md: set[str] = set()
+        for f in all_findings:
+            if f.get("skill_name") != "read_attachments":
+                continue
+            result = f.get("result") or {}
+            # Only use extracts from the cp3_methodology namespace
+            if result.get("namespace", _CP3_NAMESPACE) != _CP3_NAMESPACE:
+                continue
+            md_path_str = result.get("md_path", "")
+            if not md_path_str or md_path_str in seen_md:
+                continue
+            seen_md.add(md_path_str)
+            md_path = Path(md_path_str)
+            if md_path.exists():
+                try:
+                    md_content = md_path.read_text(encoding="utf-8", errors="ignore")
+                    pdf_context.append({"file": md_path.stem, "methodology_notes": md_content})
+                except Exception:
+                    pass
 
     preserved_sections: dict[str, Any] = state.get("cp3_preserved_sections") or {}
     evaluation = state.get("evaluation")

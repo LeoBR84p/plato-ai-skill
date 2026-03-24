@@ -194,6 +194,87 @@ def build_refine_design_messages(
 
 
 # ---------------------------------------------------------------------------
+# EXTRACT_PDF_METHODOLOGY — Phase 1: extract methodology-relevant content from
+# a single PDF, saved as a compact .md file in attachments/ for RAG reuse.
+# ---------------------------------------------------------------------------
+
+EXTRACT_PDF_METHODOLOGY_SYSTEM = """\
+Você é um assistente de pesquisa acadêmica especializado em extração metodológica.
+Sua tarefa é ler o texto de um artigo ou documento científico e extrair,
+de forma compacta e estruturada, APENAS as informações metodológicas relevantes
+para fundamentar um Research Design (Checkpoint 3).
+
+Extraia apenas o que está EXPLICITAMENTE no texto. Não invente, não infira,
+não complemente com conhecimento externo. Se uma seção não se aplica,
+escreva "Não mencionado".
+
+Seja conciso: o objetivo é produzir uma nota de referência rápida (~300-500 palavras),
+não um resumo completo do artigo.
+"""
+
+EXTRACT_PDF_METHODOLOGY_USER = """\
+Arquivo: {filename}
+
+Texto do documento (pode estar truncado):
+---
+{text}
+---
+
+Extraia as informações metodológicas no seguinte formato Markdown:
+
+## {filename}
+
+**Tipo de estudo:** (experimental / quasi-experimental / observacional / estudo-de-caso / revisão-sistemática / misto / não especificado)
+
+**Método principal:** (descrição em 1-2 frases)
+
+**Hipóteses / Questões de pesquisa:**
+(liste ou escreva "Não mencionado")
+
+**Variáveis principais:**
+(VI, VD, confundidoras — ou "Não mencionado")
+
+**Instrumentos e protocolo de coleta:**
+(questionários, sensores, APIs, entrevistas, etc. — ou "Não mencionado")
+
+**Métricas e critérios de avaliação:**
+(KPIs, limiares, poder estatístico — ou "Não mencionado")
+
+**Tamanho/estratégia amostral:**
+(n=?, critério de inclusão/exclusão — ou "Não mencionado")
+
+**Considerações éticas mencionadas:**
+(CEP, LGPD, consentimento — ou "Não mencionado")
+
+**Autoridades metodológicas citadas:**
+(autores/obras usados para justificar o método — ou "Nenhuma")
+
+**Insights metodológicos relevantes para CP3:**
+(1-3 pontos que podem informar o design desta pesquisa)
+"""
+
+
+def build_extract_pdf_methodology_messages(
+    filename: str,
+    text: str,
+) -> tuple[str, list[dict[str, str]]]:
+    """Build messages to extract methodology-relevant content from a single PDF.
+
+    Args:
+        filename: Name of the PDF file (used as heading in the .md output).
+        text: Extracted text from the PDF (may be truncated).
+
+    Returns:
+        Tuple of (system_prompt, messages_list).
+    """
+    user_content = EXTRACT_PDF_METHODOLOGY_USER.format(
+        filename=filename,
+        text=text[:10000],  # ~2500 tokens — enough for most papers
+    )
+    return EXTRACT_PDF_METHODOLOGY_SYSTEM, [{"role": "user", "content": user_content}]
+
+
+# ---------------------------------------------------------------------------
 # IDEATE — Phase 2: propose the research design (ideation, not retrieval)
 # ---------------------------------------------------------------------------
 

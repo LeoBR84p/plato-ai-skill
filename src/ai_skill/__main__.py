@@ -2001,8 +2001,18 @@ def _print_node_progress(
             total_n = len(findings)
             extra = f" [dim](+{new_n} novos · {total_n} no total)[/dim]"
         elif node_name == "read_attachments" and findings is not None:
-            n = len(findings) - prev_findings_count
-            extra = f" [dim]({n} PDF(s) lido(s))[/dim]"
+            current_batch = [
+                f for f in findings[prev_findings_count:]
+                if f.get("skill_name") == "read_attachments"
+            ]
+            cached = sum(1 for f in current_batch if (f.get("result") or {}).get("cached"))
+            new_n = len(current_batch) - cached
+            parts = []
+            if new_n:
+                parts.append(f"{new_n} extraído(s)")
+            if cached:
+                parts.append(f"{cached} do cache")
+            extra = f" [dim]({', '.join(parts)})[/dim]" if parts else ""
         elif node_name == "ideate_design":
             design_doc = output.get("research_design_doc") or {}
             sections = design_doc.get("sections") or []
