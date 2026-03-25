@@ -1963,6 +1963,14 @@ _NODE_LABELS: dict[str, str] = {
 # CP3 no longer uses the plan/execute labels — the dict is kept for other stages
 _NODE_LABELS_CP3: dict[str, str] = {}
 
+_NODE_LABELS_CP4: dict[str, str] = {
+    "draft_collection_guide":          "Elaborando Guia de Coleta de Dados",
+    "review_collection_standards":     "Revisando contra FAIR · ISO 25012 · PMBOK · PRISMA · ABNT",
+    "evaluate_collection_objectives":  "Avaliando alinhamento com objetivos da pesquisa",
+    "deliver_collection_guide":        "Gerando documento CP4",
+    "refine_collection_guide":         "Aplicando correções ao Guia de Coleta",
+}
+
 
 def _print_node_progress(
     node_name: str,
@@ -1985,6 +1993,8 @@ def _print_node_progress(
     """
     if stage == "research_design":
         label = _NODE_LABELS_CP3.get(node_name) or _NODE_LABELS.get(node_name, node_name)
+    elif stage == "data_collection_guide":
+        label = _NODE_LABELS_CP4.get(node_name) or _NODE_LABELS.get(node_name, node_name)
     else:
         label = _NODE_LABELS.get(node_name, node_name)
     extra = ""
@@ -2722,6 +2732,286 @@ def _design_review(workspace: Path | None) -> None:
         ws.save_state(current_state)
         console.print("\n[yellow]Revisão pausada. Retome com:[/yellow]")
         console.print(f"  ai-skill design --review --workspace \"{state_path}\"")
+        sys.exit(0)
+
+
+@app.command("collection")
+def collection_cmd(
+    begin: Annotated[
+        bool,
+        typer.Option("--begin", is_flag=True, help="Iniciar o Guia de Coleta (CP4)."),
+    ] = False,
+    review: Annotated[
+        bool,
+        typer.Option("--review", is_flag=True, help="Aplicar correções ao último preview do CP4."),
+    ] = False,
+    signoff: Annotated[
+        bool,
+        typer.Option("--signoff", is_flag=True, help="Aprovar preview e gerar arquivo final."),
+    ] = False,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Diretório do workspace."),
+    ] = None,
+) -> None:
+    """Gerenciar o Guia de Coleta de Dados (Checkpoint 4).
+
+    Use uma das flags para selecionar a ação:\n
+      --begin     Iniciar a elaboração do Guia de Coleta\n
+      --review    Revisar o último preview (aplicar correções do Word)\n
+      --signoff   Aprovar o preview atual e gerar arquivo final
+    """
+    flags = [begin, review, signoff]
+    if sum(flags) > 1:
+        console.print("[red]Use apenas uma flag por vez: --begin, --review ou --signoff.[/red]")
+        raise typer.Exit(1)
+    if not any(flags):
+        console.print(
+            "\n[bold]ai-skill collection[/bold]  —  Guia de Coleta de Dados (CP4)\n\n"
+            "  [cyan]--begin[/cyan]     Iniciar a elaboração do Guia de Coleta\n"
+            "  [cyan]--review[/cyan]    Revisar o último preview (aplicar correções do Word)\n"
+            "  [cyan]--signoff[/cyan]   Aprovar o preview atual e gerar arquivo final\n"
+        )
+        raise typer.Exit(0)
+
+    if begin:
+        begin_collection(workspace=workspace)
+    elif review:
+        _collection_review(workspace=workspace)
+    elif signoff:
+        ws_path = _resolve_workspace_path(workspace, state_subdir=True)
+        if ws_path is None:
+            raise typer.Exit(1)
+        _signoff_checkpoint(ws_path, 4)
+
+
+@app.command("begin-collection")
+def begin_collection(
+    workspace: Annotated[
+        Path | None,
+        typer.Option(
+            "--workspace", "-w",
+            help="ProjectWorkspace ou diretório .state/ do projeto.",
+        ),
+    ] = None,
+) -> None:
+    """Iniciar o Guia de Coleta de Dados (Checkpoint 4).
+
+    Requer que o Checkpoint 3 (Research Design) já esteja aprovado.
+    """
+    _configure_logging(os.environ.get("AI_SKILL_LOG_LEVEL", "WARNING"))
+
+    # --- Resolve project path ---
+    resolved = _resolve_workspace_path(workspace, state_subdir=False)
+    if resolved is None:
+        raise typer.Exit(1)
+
+    if (resolved / "workspace.yaml").exists():
+        project_path = resolved
+        state_path = resolved / ".state"
+    elif (resolved.parent / "workspace.yaml").exists():
+        project_path = resolved.parent
+        state_path = resolved
+    else:
+        console.print(
+            "[red]Workspace não reconhecido.[/red]\n"
+            "[dim]Aponte --workspace para o ProjectWorkspace "
+            "ou para o diretório .state/ dentro dele.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # --- Validate CP3 [final].docx exists ---
+    from ai_skill.core.project_workspace import ProjectWorkspace
+    pw = ProjectWorkspace.from_path(project_path)
+    final_cp3 = pw.checkpoint_final_path(3)
+
+    if not final_cp3.exists():
+        console.print(
+            f"\n[red]✗ Checkpoint 3 não aprovado.[/red]\n"
+            f"  O arquivo [bold]{final_cp3.name}[/bold] não foi encontrado em:\n"
+            f"  {project_path}\n"
+            f"\n[dim]Complete o Checkpoint 3 antes de iniciar o Guia de Coleta:[/dim]\n"
+            f"  ai-skill design --begin --workspace \"{project_path}\"\n"
+            f"  ai-skill design --signoff --workspace \"{state_path}\""
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Checkpoint 3 aprovado: [dim]{final_cp3.name}[/dim]")
+
+    # --- Warn if CP4 work already exists ---
+    _warn_overwrite(project_path, checkpoints=[4])
+
+    # --- Load state ---
+    from ai_skill.core.graph import build_cp4_graph
+    from ai_skill.core.workspace import ResearchWorkspace
+
+    ws = ResearchWorkspace(state_path)
+    state = ws.load_state()
+
+    if state is None:
+        console.print(
+            "[red]Não foi possível carregar o estado do projeto.[/red]\n"
+            "[dim]Tente re-rodar:[/dim]\n"
+            f"  ai-skill design --begin --workspace \"{project_path}\""
+        )
+        raise typer.Exit(1)
+
+    # Guarantee prior checkpoints are marked approved
+    state["charter_approved"] = True
+    state["literature_approved"] = True
+    state["design_approved"] = True
+    state["user_feedback"] = None
+    state["attempt"] = 0
+
+    # Set correct stage for CP4 routing
+    from ai_skill.core.pipeline_stages import PipelineStage as _PS
+    state["stage"] = _PS.DATA_COLLECTION_GUIDE
+
+    # Build CP4 handoff context from the approved research_design_doc
+    design_doc = state.get("research_design_doc") or {}
+    _full_obj = state.get("objective") or {}
+    state["cp4_context"] = {
+        "topic":               _full_obj.get("topic") or "",
+        "goals":               list(_full_obj.get("goals") or []),
+        "scope_constraints":   list(_full_obj.get("scope_constraints") or []),
+        "study_type":          design_doc.get("study_type") or "",
+        "hypotheses":          list(design_doc.get("hypotheses") or []),
+        "variables":           list(design_doc.get("variables") or []),
+        "metrics_and_kpis":    list(design_doc.get("metrics_and_kpis") or []),
+        "data_sources":        list(design_doc.get("data_sources") or []),
+        "collection_protocol": design_doc.get("collection_protocol") or "",
+        "instruments":         list(design_doc.get("instruments") or []),
+        "sampling_strategy":   design_doc.get("sampling_strategy") or "",
+        "sample_size_justification": design_doc.get("sample_size_justification") or "",
+        "ethical_considerations":    design_doc.get("ethical_considerations") or "",
+        "data_management_plan":      design_doc.get("data_management_plan") or "",
+    }
+
+    # Reset CP4 convergence state
+    state["cp4_preserved_sections"] = {}
+    state["collection_guide_approved"] = False
+
+    topic = _full_obj.get("topic", "")
+    console.print(
+        f"\n[bold]Iniciando Guia de Coleta de Dados[/bold]"
+        + (f": {topic}" if topic else "")
+    )
+    console.print(
+        "\n[dim]Fase 1: elaboração do guia a partir do Research Design aprovado (CP3).[/dim]\n"
+        "[dim]Fase 2: buscas web sobre FAIR · ISO 25012 · PMBOK · PRISMA · ABNT são automáticas.[/dim]\n"
+        "[dim]Fase 3: avaliação de alinhamento com os objetivos de pesquisa (CP1).[/dim]"
+    )
+
+    # --- Stream the CP4 graph ---
+    graph_instance = build_cp4_graph()
+    current_state: dict = dict(state)
+
+    try:
+        for event in graph_instance.stream(state, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                if node_name == "__interrupt__":
+                    ws.save_state(current_state)
+                    _handle_checkpoint(node_output, current_state, state_path)
+                    return
+                _print_node_progress(node_name, node_output, 0, stage="data_collection_guide")
+                if isinstance(node_output, dict):
+                    current_state.update(node_output)
+                    ws.save_state(current_state)
+                    if (
+                        node_name == "review_collection_guide"
+                        and node_output.get("collection_guide_approved")
+                    ):
+                        _finalize_checkpoint(state_path, 4)
+    except _GRAPH_INTERRUPT as _exc:  # type: ignore[misc]
+        ws.save_state(current_state)
+        _handle_checkpoint(_exc, current_state, state_path)
+        return
+    except KeyboardInterrupt:
+        ws.save_state(current_state)
+        console.print("\n[yellow]Elaboração pausada. Retome com:[/yellow]")
+        console.print(f"  ai-skill collection --review --workspace \"{state_path}\"")
+        sys.exit(0)
+
+
+def _collection_review(workspace: Path | None) -> None:
+    """Apply researcher corrections from the last CP4 preview and re-run."""
+    from ai_skill.core.graph import build_cp4_graph
+    from ai_skill.core.workspace import ResearchWorkspace
+
+    _configure_logging(os.environ.get("AI_SKILL_LOG_LEVEL", "WARNING"))
+
+    resolved = _resolve_workspace_path(workspace, state_subdir=True)
+    if resolved is None:
+        raise typer.Exit(1)
+
+    if (resolved / "workspace.yaml").exists():
+        project_path = resolved
+        state_path = resolved / ".state"
+    elif (resolved.parent / "workspace.yaml").exists():
+        project_path = resolved.parent
+        state_path = resolved
+    else:
+        console.print("[red]Workspace não reconhecido.[/red]")
+        raise typer.Exit(1)
+
+    from ai_skill.core.project_workspace import ProjectWorkspace
+    pw = ProjectWorkspace.from_path(project_path)
+
+    last_preview = pw.get_last_preview(4)
+    if last_preview is None:
+        console.print(
+            "[red]Nenhum preview do CP4 encontrado.[/red]\n"
+            "[dim]Execute primeiro:[/dim]  "
+            f"ai-skill collection --begin --workspace \"{project_path}\""
+        )
+        raise typer.Exit(1)
+
+    ws = ResearchWorkspace(state_path)
+    state = ws.load_state() or {}
+
+    feedback = _extract_docx_corrections(last_preview)
+    if not feedback:
+        console.print(
+            "[yellow]Nenhuma correção encontrada no preview.[/yellow]\n"
+            "[dim]Adicione comentários, marcas de revisão ou realce amarelo no arquivo:[/dim]\n"
+            f"  {last_preview}"
+        )
+        raise typer.Exit(0)
+
+    formatted_feedback = _format_corrections_for_llm(feedback)
+    state["user_feedback"] = formatted_feedback
+    state["collection_guide_approved"] = False
+
+    from ai_skill.core.pipeline_stages import PipelineStage as _PS
+    state["stage"] = _PS.DATA_COLLECTION_GUIDE
+
+    graph_instance = build_cp4_graph()
+    current_state: dict = dict(state)
+
+    try:
+        for event in graph_instance.stream(state, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                if node_name == "__interrupt__":
+                    ws.save_state(current_state)
+                    _handle_checkpoint(node_output, current_state, state_path)
+                    return
+                _print_node_progress(node_name, node_output, 0, stage="data_collection_guide")
+                if isinstance(node_output, dict):
+                    current_state.update(node_output)
+                    ws.save_state(current_state)
+                    if (
+                        node_name == "review_collection_guide"
+                        and node_output.get("collection_guide_approved")
+                    ):
+                        _finalize_checkpoint(state_path, 4)
+    except _GRAPH_INTERRUPT as _exc:  # type: ignore[misc]
+        ws.save_state(current_state)
+        _handle_checkpoint(_exc, current_state, state_path)
+        return
+    except KeyboardInterrupt:
+        ws.save_state(current_state)
+        console.print("\n[yellow]Revisão pausada. Retome com:[/yellow]")
+        console.print(f"  ai-skill collection --review --workspace \"{state_path}\"")
         sys.exit(0)
 
 

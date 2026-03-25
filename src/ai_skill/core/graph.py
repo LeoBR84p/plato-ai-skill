@@ -60,9 +60,13 @@ from ai_skill.core.nodes import (
     compile_literature,
     cp2_router,
     cp3_router,
+    cp4_router,
+    deliver_collection_guide,
     deliver_design,
     deliver_literature,
+    draft_collection_guide,
     evaluate,
+    evaluate_collection_objectives,
     evaluate_objectives,
     execute,
     ideate_design,
@@ -70,20 +74,26 @@ from ai_skill.core.nodes import (
     plan,
     read_attachments,
     recheck_sources,
+    refine_collection_guide,
     refine_design,
     refine_literature,
     request_support,
     review_charter,
+    review_collection_guide,
+    review_collection_standards,
     review_design,
     review_frameworks,
     review_literature,
     route_after_evaluate,
+    route_after_evaluate_collection,
     route_after_evaluate_objectives,
     route_after_review_charter,
+    route_after_review_collection,
     route_after_review_design,
     route_after_review_literature,
     route_cp2_start,
     route_cp3_start,
+    route_cp4_start,
     verify_literature,
 )
 from ai_skill.core.state import ResearchState
@@ -244,6 +254,72 @@ def build_cp3_graph() -> "CompiledGraph":  # type: ignore[name-defined]
     builder.add_edge("refine_design", "deliver_design")
 
     return builder.compile(interrupt_before=["review_design", "request_support"])
+
+
+def build_cp4_graph() -> "CompiledGraph":  # type: ignore[name-defined]
+    """Build and compile the Checkpoint 4 (Data Collection Guide) graph.
+
+    3-phase pipeline:
+        Phase 1 — draft_collection_guide:      operationalises CP3 into 8-section guide
+        Phase 2 — review_collection_standards: web critique: FAIR/ISO/PMBOK/PRISMA/ABNT
+        Phase 3 — evaluate_collection_objectives: scores sections vs CP1 + CP3
+
+    Loop: on non-convergence, evaluate_collection_objectives → draft_collection_guide
+    (preserving high-scoring sections).  After max retries: request_support.
+    Researcher correction cycle: cp4_router → refine_collection_guide.
+
+    Returns:
+        Compiled LangGraph StateGraph for CP4.
+    """
+    builder: StateGraph = StateGraph(ResearchState)
+
+    builder.add_node("cp4_router",                    cp4_router)
+    builder.add_node("draft_collection_guide",        draft_collection_guide)
+    builder.add_node("review_collection_standards",   review_collection_standards)
+    builder.add_node("evaluate_collection_objectives", evaluate_collection_objectives)
+    builder.add_node("request_support",               request_support)
+    builder.add_node("deliver_collection_guide",      deliver_collection_guide)
+    builder.add_node("review_collection_guide",       review_collection_guide)
+    builder.add_node("refine_collection_guide",       refine_collection_guide)
+
+    builder.add_edge(START, "cp4_router")
+    builder.add_conditional_edges(
+        "cp4_router",
+        route_cp4_start,
+        {
+            "draft_collection_guide":  "draft_collection_guide",
+            "refine_collection_guide": "refine_collection_guide",
+        },
+    )
+
+    # Phase 1 → 2 → 3 (linear, no retry within phases)
+    builder.add_edge("draft_collection_guide",      "review_collection_standards")
+    builder.add_edge("review_collection_standards", "evaluate_collection_objectives")
+
+    # Phase 3 routing: converged → deliver | retry → draft | exhausted → support
+    builder.add_conditional_edges(
+        "evaluate_collection_objectives",
+        route_after_evaluate_collection,
+        {
+            "deliver_collection_guide": "deliver_collection_guide",
+            "draft_collection_guide":   "draft_collection_guide",
+            "request_support":          "request_support",
+        },
+    )
+    builder.add_edge("request_support", "draft_collection_guide")
+
+    # Delivery and researcher review
+    builder.add_edge("deliver_collection_guide", "review_collection_guide")
+    builder.add_conditional_edges(
+        "review_collection_guide",
+        route_after_review_collection,
+        {"END": END, "refine_collection_guide": "refine_collection_guide"},
+    )
+    builder.add_edge("refine_collection_guide", "deliver_collection_guide")
+
+    return builder.compile(
+        interrupt_before=["review_collection_guide", "request_support"]
+    )
 
 
 def get_graph_mermaid() -> str:

@@ -29,6 +29,8 @@ from ai_skill.core.llm_client import LLMClient, LLMClientError, set_current_node
 from ai_skill.core.pipeline_stages import PipelineStage, ResearchStatus
 from ai_skill.core.project_workspace import ProjectWorkspace
 from ai_skill.core.state import (
+    DataCollectionGuideDoc,
+    DataCollectionSection,
     EvaluationResult,
     ExecutionPlan,
     LiteratureReviewDoc,
@@ -61,6 +63,13 @@ from ai_skill.prompts.literature import (
     build_compile_messages,
     build_refine_messages,
     build_verify_messages,
+)
+from ai_skill.prompts.collection import (
+    CP4_FRAMEWORK_QUERIES,
+    build_draft_collection_guide_messages,
+    build_evaluate_collection_objectives_messages,
+    build_refine_collection_guide_messages,
+    build_review_collection_standards_messages,
 )
 from ai_skill.prompts.planning import build_planning_messages
 from ai_skill.core.rag import RagIndex
@@ -1541,7 +1550,7 @@ def compile_design(
             messages=messages,
             response_model=_ResearchDesignDocLLM,
             system=system,
-            max_tokens=16384,
+            max_tokens=32768,
         )
     except LLMClientError as exc:
         logger.error("compile_design failed: %s", exc)
@@ -1686,7 +1695,7 @@ def refine_design(
             messages=messages,
             response_model=_ResearchDesignDocLLM,
             system=system,
-            max_tokens=16384,
+            max_tokens=32768,
         )
     except LLMClientError as exc:
         logger.error("refine_design failed: %s", exc)
@@ -2032,24 +2041,45 @@ def ideate_design(
         "timeline schedule milestones PMBOK planning executing",
     ]
 
+    # ── Context budget control ────────────────────────────────────────────────
+    # The user message must stay well below the model's context window.
+    # Rough budget (chars → tokens ≈ ÷ 4):
+    #   charter_text:      ≤ 8 000 chars  (~2 000 tokens)
+    #   literature_text:   ≤ 16 000 chars (~4 000 tokens)
+    #   pdf_context total: ≤ 12 000 chars (~3 000 tokens) — top-8 unique docs × 1 500 chars
+    #   preserved + gaps:  ≤  4 000 chars (~1 000 tokens)
+    #   system prompt:     ~  3 000 tokens
+    #   TOTAL INPUT:       ~13 000 tokens  →  leaves ~50 000 tokens for output (ample)
+    _CHARTER_CHAR_LIMIT   = 8_000
+    _LITERATURE_CHAR_LIMIT = 16_000
+    _PDF_EXCERPT_LIMIT    = 1_500   # chars per doc in pdf_context
+    _PDF_DOCS_LIMIT       = 8       # max unique docs included
+
+    charter_text  = (charter_text or "")[:_CHARTER_CHAR_LIMIT]
+    literature_text = (literature_text or "")[:_LITERATURE_CHAR_LIMIT]
+
     pdf_context: list[dict[str, Any]] = []
     seen_in_context: set[str] = set()
 
     if rag is not None and rag.size() > 0:
         for query in _SECTION_QUERIES:
-            for doc_id, excerpt, score in rag.search(query, top_k=3):
-                if doc_id not in seen_in_context:
+            if len(seen_in_context) >= _PDF_DOCS_LIMIT:
+                break
+            for doc_id, excerpt, score in rag.search(query, top_k=2):
+                if doc_id not in seen_in_context and len(seen_in_context) < _PDF_DOCS_LIMIT:
                     seen_in_context.add(doc_id)
                     pdf_context.append({
                         "file": doc_id,
                         "relevance_score": round(score, 3),
-                        "methodology_notes": excerpt,
+                        "methodology_notes": excerpt[:_PDF_EXCERPT_LIMIT],
                     })
     else:
         # Fallback: read namespaced .md files from findings if index not available
         all_findings = state.get("findings", [])
         seen_md: set[str] = set()
         for f in all_findings:
+            if len(pdf_context) >= _PDF_DOCS_LIMIT:
+                break
             if f.get("skill_name") != "read_attachments":
                 continue
             result = f.get("result") or {}
@@ -2064,7 +2094,10 @@ def ideate_design(
             if md_path.exists():
                 try:
                     md_content = md_path.read_text(encoding="utf-8", errors="ignore")
-                    pdf_context.append({"file": md_path.stem, "methodology_notes": md_content})
+                    pdf_context.append({
+                        "file": md_path.stem,
+                        "methodology_notes": md_content[:_PDF_EXCERPT_LIMIT],
+                    })
                 except Exception:
                     pass
 
@@ -2086,7 +2119,7 @@ def ideate_design(
             messages=messages,
             response_model=_ResearchDesignDocLLM,
             system=system,
-            max_tokens=16384,
+            max_tokens=32768,   # raised: 9 sections × prose + structured fields needs room
         )
     except LLMClientError as exc:
         logger.error("ideate_design failed: %s", exc)
@@ -2212,7 +2245,7 @@ def review_frameworks(
             messages=messages,
             response_model=_ResearchDesignDocLLM,
             system=system,
-            max_tokens=16384,
+            max_tokens=32768,
         )
     except LLMClientError as exc:
         logger.error("review_frameworks failed: %s — keeping Phase 2 draft", exc)
@@ -3521,3 +3554,759 @@ async def _run_batch_async(
     return dict(results)
 
 
+# ===========================================================================
+# CP4 — Data Collection Guide
+# ===========================================================================
+# Three-phase pipeline:
+#   Phase 1 — draft_collection_guide      (operationalise CP3 into 8-section guide)
+#   Phase 2 — review_collection_standards (web critique: FAIR/ISO/PMBOK/PRISMA/ABNT)
+#   Phase 3 — evaluate_collection_objectives (score 8 sections vs CP1 + CP3)
+#
+# Principle: agent is methodologist only. Never generates/fabricates research data.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Pydantic structured-output models for CP4
+# ---------------------------------------------------------------------------
+
+
+class _CollectionSectionLLM(BaseModel):
+    """One section of the Data Collection Guide."""
+
+    section_title: str = Field(description="Section heading in pt-BR.")
+    content: str = Field(description="Body text in pt-BR Markdown (prose, templates, checklists).")
+
+
+class _CollectionStepLLM(BaseModel):
+    """One step in the step-by-step collection protocol."""
+
+    step_id: int = Field(description="Sequential step number (1-based).")
+    description: str = Field(description="What to do in this step.")
+    responsible: str = Field(description="Role or person responsible.")
+    tool: str = Field(description="Tool, platform, or instrument used.")
+    acceptance_criterion: str = Field(
+        description="Observable evidence that this step was completed successfully."
+    )
+
+
+class _DataDictionaryEntryLLM(BaseModel):
+    """One variable definition in the data dictionary."""
+
+    variable: str = Field(description="Variable/column name (snake_case).")
+    type: str = Field(description="Data type: string | integer | float | boolean | date | categorical.")
+    unit: str = Field(description="Unit of measurement, or 'N/A'.")
+    encoding: str = Field(description="Value encoding (e.g. 0=Não, 1=Sim) or 'free text'.")
+    nullable: bool = Field(description="Whether the field may be missing/null.")
+
+
+class _ContingencyPlanLLM(BaseModel):
+    """One contingency scenario."""
+
+    trigger: str = Field(description="Observable condition that activates this contingency.")
+    action: str = Field(description="Steps to take when triggered.")
+    responsible: str = Field(description="Role or person responsible for executing the action.")
+
+
+class _DataCollectionGuideDocLLM(BaseModel):
+    """Full structured Data Collection Guide — enforces consistent output format for CP4."""
+
+    sections: list[_CollectionSectionLLM] = Field(
+        min_length=1,
+        description="Ordered sections covering all 8 mandatory headings.",
+    )
+    instruments: list[str] = Field(
+        default_factory=list,
+        description="List of collection instruments (name, type, version, reference).",
+    )
+    collection_steps: list[_CollectionStepLLM] = Field(
+        default_factory=list,
+        description="Ordered step-by-step protocol.",
+    )
+    sampling_strategy: str = Field(description="Sampling approach description.")
+    min_sample_size: int = Field(default=0, description="Minimum required sample size (n).")
+    sample_size_rationale: str = Field(description="Power analysis or saturation rationale.")
+    inclusion_criteria: list[str] = Field(
+        default_factory=list, description="Participant/data inclusion criteria."
+    )
+    exclusion_criteria: list[str] = Field(
+        default_factory=list, description="Participant/data exclusion criteria."
+    )
+    data_dictionary: list[_DataDictionaryEntryLLM] = Field(
+        default_factory=list, description="Variable definitions."
+    )
+    data_format: str = Field(
+        description="Expected delivery format: CSV | JSON | XLSX | SQL | outro."
+    )
+    acceptance_criteria_per_step: list[str] = Field(
+        default_factory=list,
+        description="Quality gate per collection step (same order as collection_steps).",
+    )
+    tcle_elements: list[str] = Field(
+        default_factory=list,
+        description="Minimum TCLE elements per CNS 466/2012.",
+    )
+    lgpd_measures: list[str] = Field(
+        default_factory=list,
+        description="LGPD compliance measures (pseudonymisation, retention, etc.).",
+    )
+    cep_required: bool = Field(
+        default=False, description="Whether CEP/CONEP submission is required."
+    )
+    pre_collection_checklist: list[str] = Field(
+        default_factory=list, description="Ordered checklist items before starting collection."
+    )
+    contingency_plans: list[_ContingencyPlanLLM] = Field(
+        default_factory=list, description="Contingency scenarios."
+    )
+
+
+# ---------------------------------------------------------------------------
+# CP4 router and entry-point
+# ---------------------------------------------------------------------------
+
+
+def cp4_router(_state: ResearchState) -> dict[str, Any]:
+    """Entry-point no-op for CP4; routing logic lives in route_cp4_start.
+
+    Returns:
+        Empty dict (no state changes).
+    """
+    return {}
+
+
+def route_cp4_start(state: ResearchState) -> str:
+    """Conditional edge from cp4_router.
+
+    Returns ``"refine_collection_guide"`` when a guide exists and the user has
+    provided feedback (correction cycle).  Otherwise starts fresh from
+    ``"draft_collection_guide"``.
+
+    Args:
+        state: Current ResearchState.
+
+    Returns:
+        Name of the next node.
+    """
+    if state.get("data_collection_guide_doc") and state.get("user_feedback"):
+        return "refine_collection_guide"
+    return "draft_collection_guide"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — draft_collection_guide
+# ---------------------------------------------------------------------------
+
+
+def draft_collection_guide(
+    state: ResearchState,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Phase 1 of CP4: operationalise CP3 into the full Data Collection Guide.
+
+    Reads the approved ResearchDesignDoc (CP3) and the CP1 research objectives,
+    then proposes a complete 8-section guide with instruments, protocol,
+    sampling, data specification, acceptance criteria, ethics/legal compliance,
+    pre-collection checklist, and contingency plan.
+
+    The LLM is expected to PROPOSE — not merely summarise CP3.  It may go
+    beyond the CP3 text wherever additional operational precision is needed.
+
+    Args:
+        state: Current ResearchState with research_design_doc (CP3 approved)
+            and objective (CP1).
+        llm: Optional LLMClient override (useful for testing).
+
+    Returns:
+        Partial state with data_collection_guide_doc and status=EVALUATING.
+    """
+    _configure_history(state, "draft_collection_guide")
+    _llm = llm or LLMClient()
+
+    design_doc = state.get("research_design_doc") or {}
+    objective = state.get("cp4_context") or state.get("objective") or {}
+    preserved_sections: dict[str, Any] = state.get("cp4_preserved_sections") or {}
+    evaluation = state.get("evaluation")
+    gaps: list[str] = evaluation.get("gaps", []) if evaluation else []
+
+    system, messages = build_draft_collection_guide_messages(
+        objective=objective,
+        design_doc=dict(design_doc),
+        preserved_sections=preserved_sections,
+        gaps=gaps,
+    )
+
+    try:
+        guide_obj: _DataCollectionGuideDocLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_DataCollectionGuideDocLLM,
+            system=system,
+            max_tokens=32768,
+        )
+    except LLMClientError as exc:
+        logger.error("draft_collection_guide failed: %s", exc)
+        return {"status": ResearchStatus.FAILED}
+
+    sections: list[DataCollectionSection] = [
+        DataCollectionSection(section_title=s.section_title, content=s.content)
+        for s in guide_obj.sections
+    ]
+    guide_doc = DataCollectionGuideDoc(
+        sections=sections,
+        instruments=guide_obj.instruments,
+        collection_steps=[step.model_dump() for step in guide_obj.collection_steps],
+        sampling_strategy=guide_obj.sampling_strategy,
+        min_sample_size=guide_obj.min_sample_size,
+        sample_size_rationale=guide_obj.sample_size_rationale,
+        inclusion_criteria=guide_obj.inclusion_criteria,
+        exclusion_criteria=guide_obj.exclusion_criteria,
+        data_dictionary=[e.model_dump() for e in guide_obj.data_dictionary],
+        data_format=guide_obj.data_format,
+        acceptance_criteria_per_step=guide_obj.acceptance_criteria_per_step,
+        tcle_elements=guide_obj.tcle_elements,
+        lgpd_measures=guide_obj.lgpd_measures,
+        cep_required=guide_obj.cep_required,
+        pre_collection_checklist=guide_obj.pre_collection_checklist,
+        contingency_plans=[cp.model_dump() for cp in guide_obj.contingency_plans],
+    )
+    return {
+        "data_collection_guide_doc": guide_doc,
+        "status": ResearchStatus.EVALUATING,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — review_collection_standards
+# ---------------------------------------------------------------------------
+
+
+def review_collection_standards(
+    state: ResearchState,
+    registry: SkillRegistry | None = None,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Phase 2 of CP4: critique guide against FAIR, ISO 25012, PMBOK, PRISMA, ABNT.
+
+    Runs web searches for the relevant standards (always authorised — no Y/n
+    required) and calls the LLM to apply targeted corrections to the guide.
+    Sections already compliant are returned verbatim.
+
+    Args:
+        state: Current ResearchState with data_collection_guide_doc from Phase 1
+            and research_design_doc (CP3, used as reference to avoid contradictions).
+        registry: Optional injected SkillRegistry (for testing).
+        llm: Optional LLMClient override.
+
+    Returns:
+        Partial state with (possibly corrected) data_collection_guide_doc.
+        Returns empty dict on LLM error (keeps Phase 1 draft).
+    """
+    _configure_history(state, "review_collection_standards")
+    _registry = registry or _get_default_registry()
+    _llm = llm or LLMClient()
+
+    guide_doc = state.get("data_collection_guide_doc")
+    if not guide_doc:
+        logger.warning("review_collection_standards: no data_collection_guide_doc — skipping.")
+        return {}
+
+    design_doc = state.get("research_design_doc") or {}
+
+    # Web searches for methodology standards (always allowed)
+    web_skill = _registry.get("web_search")
+    search_snippets: list[str] = []
+    pmbok_context = ""
+    prisma_traice_context = ""
+
+    if web_skill is not None:
+        for query in CP4_FRAMEWORK_QUERIES:
+            skill_input = SkillInput({
+                "parameters": {
+                    "query": query,
+                    "max_results": 5,
+                    "language": "en",
+                    "_skill_name": "web_search",
+                },
+                "objective": state.get("objective"),
+                "stage": PipelineStage.DATA_COLLECTION_GUIDE.value,
+                "attempt": state.get("attempt", 0),
+            })
+            out = web_skill.run(skill_input)
+            if not out.get("error"):
+                results = (out.get("result") or {}).get("results", [])
+                for r in results[:3]:
+                    snippet = r.get("snippet") or r.get("description") or ""
+                    title = r.get("title") or ""
+                    if snippet:
+                        search_snippets.append(f"[{title}] {snippet}")
+                        if "PMBOK" in title or "PMBOK" in snippet:
+                            pmbok_context += f"\n{snippet}"
+                        if "trAIce" in title or "trAIce" in snippet:
+                            prisma_traice_context += f"\n{snippet}"
+
+    framework_search_results = "\n".join(search_snippets)
+
+    system, messages = build_review_collection_standards_messages(
+        guide_doc=dict(guide_doc),
+        design_doc=dict(design_doc),
+        framework_search_results=framework_search_results,
+        pmbok_context=pmbok_context.strip(),
+        prisma_traice_context=prisma_traice_context.strip(),
+    )
+
+    try:
+        revised_obj: _DataCollectionGuideDocLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_DataCollectionGuideDocLLM,
+            system=system,
+            max_tokens=32768,
+        )
+    except LLMClientError as exc:
+        logger.error("review_collection_standards failed: %s — keeping Phase 1 draft", exc)
+        return {}
+
+    sections: list[DataCollectionSection] = [
+        DataCollectionSection(section_title=s.section_title, content=s.content)
+        for s in revised_obj.sections
+    ]
+    revised_doc = DataCollectionGuideDoc(
+        sections=sections,
+        instruments=revised_obj.instruments,
+        collection_steps=[step.model_dump() for step in revised_obj.collection_steps],
+        sampling_strategy=revised_obj.sampling_strategy,
+        min_sample_size=revised_obj.min_sample_size,
+        sample_size_rationale=revised_obj.sample_size_rationale,
+        inclusion_criteria=revised_obj.inclusion_criteria,
+        exclusion_criteria=revised_obj.exclusion_criteria,
+        data_dictionary=[e.model_dump() for e in revised_obj.data_dictionary],
+        data_format=revised_obj.data_format,
+        acceptance_criteria_per_step=revised_obj.acceptance_criteria_per_step,
+        tcle_elements=revised_obj.tcle_elements,
+        lgpd_measures=revised_obj.lgpd_measures,
+        cep_required=revised_obj.cep_required,
+        pre_collection_checklist=revised_obj.pre_collection_checklist,
+        contingency_plans=[cp.model_dump() for cp in revised_obj.contingency_plans],
+    )
+    return {"data_collection_guide_doc": revised_doc}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — evaluate_collection_objectives
+# ---------------------------------------------------------------------------
+
+
+class _CollectionSectionScoreLLM(BaseModel):
+    """Score for a single collection guide section."""
+
+    section_title: str = Field(description="Title of the section being scored.")
+    score: float = Field(description="Quality score 0.0–1.0.", ge=0.0, le=1.0)
+    rationale: str = Field(description="One-sentence justification for the score.")
+    gaps: list[str] = Field(
+        default_factory=list,
+        description="Operational gaps vs. CP1+CP3 (empty when score >= 0.85).",
+    )
+
+
+class _EvaluateCollectionObjectivesLLM(BaseModel):
+    """Per-section scores and aggregated gaps from evaluate_collection_objectives."""
+
+    sections: list[_CollectionSectionScoreLLM] = Field(
+        description="One score entry per mandatory guide section."
+    )
+    gaps: list[str] = Field(
+        description="Aggregated list of gaps across all sections with score < 0.85."
+    )
+
+
+def evaluate_collection_objectives(
+    state: ResearchState,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Phase 3 of CP4: score the guide against CP1 objectives and CP3 design.
+
+    Scores each of the 8 mandatory sections individually. Sections scoring
+    >= 0.85 are preserved verbatim in subsequent draft_collection_guide calls.
+    Computes total_score as the mean of section scores and sets
+    converged = total_score >= _CONVERGENCE_THRESHOLD.
+
+    Args:
+        state: Current ResearchState with data_collection_guide_doc from Phase 2.
+        llm: Optional LLMClient override.
+
+    Returns:
+        Partial state with evaluation, cp4_preserved_sections, attempt+1,
+        and quality_history snapshot.
+    """
+    _configure_history(state, "evaluate_collection_objectives")
+    _llm = llm or LLMClient()
+
+    guide_doc = state.get("data_collection_guide_doc")
+    if not guide_doc:
+        logger.warning("evaluate_collection_objectives: no data_collection_guide_doc — failing.")
+        return {
+            "evaluation": EvaluationResult(
+                per_metric=[], total_score=0.0, converged=False,
+                gaps=["data_collection_guide_doc ausente"], regression=False,
+            ),
+            "attempt": state.get("attempt", 0) + 1,
+        }
+
+    design_doc = state.get("research_design_doc") or {}
+    objective = state.get("cp4_context") or state.get("objective") or {}
+    attempt = state.get("attempt", 0)
+    quality_history = state.get("quality_history", [])
+    stage_str = PipelineStage.DATA_COLLECTION_GUIDE.value
+
+    system, messages = build_evaluate_collection_objectives_messages(
+        objective=objective,
+        design_doc=dict(design_doc),
+        guide_doc=dict(guide_doc),
+        threshold=_CONVERGENCE_THRESHOLD,
+    )
+
+    try:
+        eval_obj: _EvaluateCollectionObjectivesLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_EvaluateCollectionObjectivesLLM,
+            system=system,
+        )
+    except LLMClientError as exc:
+        logger.error("evaluate_collection_objectives failed: %s", exc)
+        eval_obj = _EvaluateCollectionObjectivesLLM(
+            sections=[],
+            gaps=[f"Evaluation error: {exc}"],
+        )
+
+    # Compute total_score deterministically
+    scores = [s.score for s in eval_obj.sections]
+    total_score = sum(scores) / len(scores) if scores else 0.0
+    converged = total_score >= _CONVERGENCE_THRESHOLD
+
+    # Regression detection
+    previous_score = quality_history[-1]["total_score"] if quality_history else None
+    regression = (
+        previous_score is not None and (previous_score - total_score) > 0.05
+    )
+
+    per_metric: list[MetricScore] = [
+        MetricScore(
+            metric=s.section_title,
+            score=s.score,
+            rationale=s.rationale,
+            gaps=s.gaps,
+        )
+        for s in eval_obj.sections
+    ]
+
+    evaluation = EvaluationResult(
+        per_metric=per_metric,
+        total_score=total_score,
+        converged=converged,
+        gaps=eval_obj.gaps,
+        regression=regression,
+    )
+
+    # Preserve sections scoring >= 0.85 for next iteration
+    guide_sections: list[dict[str, Any]] = guide_doc.get("sections") or []
+    section_content_by_title: dict[str, str] = {
+        s.get("section_title", ""): s.get("content", "")
+        for s in guide_sections
+    }
+    preserved: dict[str, Any] = {}
+    for s in eval_obj.sections:
+        if s.score >= 0.85:
+            content = section_content_by_title.get(s.section_title, "")
+            if content:
+                preserved[s.section_title] = {"content": content, "score": s.score}
+
+    snapshot = QualitySnapshot(
+        attempt=attempt,
+        stage=stage_str,
+        total_score=total_score,
+        per_metric_scores={s.section_title: s.score for s in eval_obj.sections},
+        skills_used=["draft_collection_guide", "review_collection_standards"],
+        cache_hit_rate=0.0,
+    )
+
+    new_quality_history = list(quality_history) + [snapshot]
+    stage_quality_history = dict(state.get("stage_quality_history") or {})
+    stage_quality_history.setdefault(stage_str, [])
+    stage_quality_history[stage_str] = list(stage_quality_history[stage_str]) + [snapshot]
+
+    if regression:
+        logger.warning(
+            "Quality regression in CP4: %.2f → %.2f (attempt %d)",
+            previous_score, total_score, attempt,
+        )
+
+    return {
+        "evaluation": evaluation,
+        "cp4_preserved_sections": preserved,
+        "attempt": attempt + 1,
+        "quality_history": new_quality_history,
+        "stage_quality_history": stage_quality_history,
+        "status": ResearchStatus.PLANNING,
+    }
+
+
+def route_after_evaluate_collection(state: ResearchState) -> str:
+    """Conditional edge after evaluate_collection_objectives in CP4.
+
+    Routes to deliver_collection_guide on convergence, draft_collection_guide
+    for retry, or request_support when max retries are exhausted.
+
+    Args:
+        state: Current ResearchState with evaluation result.
+
+    Returns:
+        Name of the next node.
+    """
+    evaluation = state.get("evaluation")
+    attempt = state.get("attempt", 0)
+    max_retries = int(os.environ.get("AI_SKILL_MAX_RETRIES", "5"))
+
+    if evaluation and evaluation.get("converged"):
+        return "deliver_collection_guide"
+    if attempt >= max_retries:
+        return "request_support"
+    return "draft_collection_guide"
+
+
+# ---------------------------------------------------------------------------
+# Deliver, review gate, refine — CP4
+# ---------------------------------------------------------------------------
+
+
+def deliver_collection_guide(state: ResearchState) -> dict[str, Any]:
+    """Generate the Data Collection Guide .docx checkpoint preview.
+
+    Converts the ``data_collection_guide_doc`` to a formatted Word document
+    and saves it as ``Checkpoint 4 - Guia de Coleta [preview_N].docx``.
+
+    Args:
+        state: Current ResearchState with a populated data_collection_guide_doc.
+
+    Returns:
+        Partial state update with checkpoint label and collection_guide_approved=False.
+    """
+    _configure_history(state, "deliver_collection_guide")
+
+    guide_doc = state.get("data_collection_guide_doc") or {}
+    workspace_path = state.get("workspace_path", "")
+
+    docx_bytes = _collection_guide_to_docx(guide_doc)
+
+    checkpoint_label = ""
+    if workspace_path:
+        pw = _get_project_workspace(workspace_path)
+        if pw and docx_bytes:
+            checkpoint_path = pw.save_checkpoint_preview(4, docx_bytes)
+            checkpoint_label = str(checkpoint_path)
+            logger.info("Collection guide checkpoint saved: %s", checkpoint_label)
+
+    return {
+        "checkpoint_label": checkpoint_label,
+        "collection_guide_approved": False,
+        "status": ResearchStatus.PLANNING,
+    }
+
+
+def review_collection_guide(state: ResearchState) -> dict[str, Any]:
+    """Gate node: check whether the researcher approved the Data Collection Guide.
+
+    Runs after the interrupt fires and the user resumes the graph.  If
+    ``user_feedback`` is present, the guide needs revision; otherwise approved.
+
+    Args:
+        state: Current ResearchState, resumed after user review.
+
+    Returns:
+        Partial state update setting collection_guide_approved and status.
+    """
+    _configure_history(state, "review_collection_guide")
+
+    if state.get("user_feedback"):
+        return {
+            "collection_guide_approved": False,
+            "status": ResearchStatus.PLANNING,
+        }
+    return {
+        "collection_guide_approved": True,
+        "status": ResearchStatus.COMPLETED,
+    }
+
+
+def route_after_review_collection(state: ResearchState) -> str:
+    """Conditional edge after review_collection_guide.
+
+    Returns:
+        ``"END"`` if approved, ``"refine_collection_guide"`` otherwise.
+    """
+    return "END" if state.get("collection_guide_approved") else "refine_collection_guide"
+
+
+def refine_collection_guide(
+    state: ResearchState,
+    llm: LLMClient | None = None,
+) -> dict[str, Any]:
+    """Apply researcher corrections to the Data Collection Guide.
+
+    Called when the user provides feedback at the Checkpoint 4 review gate.
+    Applies surgical corrections while preserving all unmarked content.
+
+    Args:
+        state: Current ResearchState with data_collection_guide_doc and user_feedback.
+        llm: Optional LLMClient override.
+
+    Returns:
+        Partial state update with the refined data_collection_guide_doc and
+        user_feedback=None.
+    """
+    _configure_history(state, "refine_collection_guide")
+    _llm = llm or LLMClient()
+
+    guide_doc = state.get("data_collection_guide_doc") or {}
+    feedback = state.get("user_feedback") or ""
+
+    system, messages = build_refine_collection_guide_messages(
+        guide_doc=dict(guide_doc),
+        feedback=feedback,
+    )
+
+    try:
+        guide_obj: _DataCollectionGuideDocLLM = _llm.complete_structured(
+            messages=messages,
+            response_model=_DataCollectionGuideDocLLM,
+            system=system,
+            max_tokens=32768,
+        )
+    except LLMClientError as exc:
+        logger.error("refine_collection_guide failed: %s", exc)
+        return {"status": ResearchStatus.FAILED}
+
+    sections: list[DataCollectionSection] = [
+        DataCollectionSection(section_title=s.section_title, content=s.content)
+        for s in guide_obj.sections
+    ]
+    updated_doc = DataCollectionGuideDoc(
+        sections=sections,
+        instruments=guide_obj.instruments,
+        collection_steps=[step.model_dump() for step in guide_obj.collection_steps],
+        sampling_strategy=guide_obj.sampling_strategy,
+        min_sample_size=guide_obj.min_sample_size,
+        sample_size_rationale=guide_obj.sample_size_rationale,
+        inclusion_criteria=guide_obj.inclusion_criteria,
+        exclusion_criteria=guide_obj.exclusion_criteria,
+        data_dictionary=[e.model_dump() for e in guide_obj.data_dictionary],
+        data_format=guide_obj.data_format,
+        acceptance_criteria_per_step=guide_obj.acceptance_criteria_per_step,
+        tcle_elements=guide_obj.tcle_elements,
+        lgpd_measures=guide_obj.lgpd_measures,
+        cep_required=guide_obj.cep_required,
+        pre_collection_checklist=guide_obj.pre_collection_checklist,
+        contingency_plans=[cp.model_dump() for cp in guide_obj.contingency_plans],
+    )
+    return {
+        "data_collection_guide_doc": updated_doc,
+        "user_feedback": None,
+        "status": ResearchStatus.EXECUTING,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Private helper: convert DataCollectionGuideDoc → .docx bytes
+# ---------------------------------------------------------------------------
+
+
+def _collection_guide_to_docx(guide_doc: dict[str, Any]) -> bytes:
+    """Convert a DataCollectionGuideDoc dict to a formatted .docx file.
+
+    Renders:
+    - Title heading "Guia de Coleta de Dados"
+    - Each section as Heading 2 + body paragraphs (Markdown-lite rendering)
+    - A structured summary block: data format, sample size, pre-collection checklist
+
+    Args:
+        guide_doc: A dict matching the DataCollectionGuideDoc shape.
+
+    Returns:
+        Raw bytes of the generated .docx file, or empty bytes on error.
+    """
+    try:
+        import io
+        from docx import Document
+    except ImportError:
+        logger.warning("python-docx not available — skipping collection guide .docx export.")
+        return b""
+
+    doc = Document()
+    doc.add_heading("Guia de Coleta de Dados", level=1)
+
+    # --- Prose sections ---
+    sections = guide_doc.get("sections", [])
+    for section in sections:
+        heading = section.get("section_title", "")
+        content = section.get("content", "")
+        if heading:
+            doc.add_heading(heading, level=2)
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("### "):
+                doc.add_heading(stripped[4:], level=3)
+            elif stripped.startswith("## "):
+                doc.add_heading(stripped[3:], level=2)
+            elif stripped.startswith("# "):
+                doc.add_heading(stripped[2:], level=1)
+            elif stripped.startswith("- "):
+                doc.add_paragraph(stripped[2:], style="List Bullet")
+            else:
+                doc.add_paragraph(stripped)
+
+    # --- Structured summary block ---
+    doc.add_heading("Resumo Estruturado", level=2)
+
+    data_format = guide_doc.get("data_format", "")
+    min_n = guide_doc.get("min_sample_size", 0)
+    rationale = guide_doc.get("sample_size_rationale", "")
+    if data_format or min_n:
+        meta = doc.add_paragraph()
+        meta.add_run("Formato dos dados: ").font.bold = True
+        meta.add_run(data_format or "—")
+        if min_n:
+            meta.add_run(f"   N mínimo: ").font.bold = True
+            meta.add_run(str(min_n))
+
+    if rationale:
+        p = doc.add_paragraph()
+        p.add_run("Justificativa amostral: ").font.bold = True
+        p.add_run(rationale)
+
+    checklist = guide_doc.get("pre_collection_checklist", [])
+    if checklist:
+        doc.add_heading("Checklist Pré-Coleta", level=3)
+        for item in checklist:
+            doc.add_paragraph(item, style="List Bullet")
+
+    contingencies = guide_doc.get("contingency_plans", [])
+    if contingencies:
+        doc.add_heading("Plano de Contingência", level=3)
+        for cp in contingencies:
+            trigger = cp.get("trigger", "")
+            action = cp.get("action", "")
+            responsible = cp.get("responsible", "")
+            if trigger:
+                p = doc.add_paragraph()
+                p.add_run("Gatilho: ").font.bold = True
+                p.add_run(trigger)
+                p.add_run("  →  Ação: ").font.bold = True
+                p.add_run(action)
+                if responsible:
+                    p.add_run("  (").font.bold = False
+                    p.add_run(responsible)
+                    p.add_run(")")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()

@@ -76,6 +76,18 @@ class ResearchDesignSection(TypedDict):
     content: str
 
 
+class DataCollectionSection(TypedDict):
+    """One section of the data collection guide (CP4).
+
+    Attributes:
+        section_title: Heading for the section.
+        content: Body text (markdown prose, templates, checklists).
+    """
+
+    section_title: str
+    content: str
+
+
 class ResearchDesignDoc(TypedDict, total=False):
     """Structured research design document produced by CP3.
 
@@ -134,6 +146,50 @@ class ResearchDesignDoc(TypedDict, total=False):
     data_sources: list[str]
     collection_protocol: str
     methodology_timeline: str
+
+
+class DataCollectionGuideDoc(TypedDict, total=False):
+    """Structured data collection guide produced by CP4.
+
+    Attributes:
+        sections: Eight mandatory sections covering instruments, protocol, sampling,
+            data specification, acceptance criteria, ethics/legal, pre-collection
+            checklist, and contingency plan.
+        instruments: Structured list with keys: name, type, version, reference.
+        collection_steps: Ordered protocol steps with keys: step_id, description,
+            responsible, tool, acceptance_criterion.
+        sampling_strategy: Sampling approach description.
+        min_sample_size: Minimum required sample size (n).
+        sample_size_rationale: Power analysis or saturation rationale.
+        inclusion_criteria: Participant/data inclusion criteria.
+        exclusion_criteria: Participant/data exclusion criteria.
+        data_dictionary: Variable definitions with keys: variable, type, unit,
+            encoding, nullable.
+        data_format: Expected delivery format (CSV | JSON | XLSX | SQL | outro).
+        acceptance_criteria_per_step: Quality gates per collection step.
+        tcle_elements: Minimum TCLE elements per CNS 466/2012.
+        lgpd_measures: LGPD compliance measures (pseudonymisation, retention, etc.).
+        cep_required: Whether CEP/CONEP submission is required.
+        pre_collection_checklist: Ordered checklist items to verify before starting.
+        contingency_plans: List of dicts with keys: trigger, action, responsible.
+    """
+
+    sections: list[DataCollectionSection]
+    instruments: list[dict[str, Any]]
+    collection_steps: list[dict[str, Any]]
+    sampling_strategy: str
+    min_sample_size: int
+    sample_size_rationale: str
+    inclusion_criteria: list[str]
+    exclusion_criteria: list[str]
+    data_dictionary: list[dict[str, Any]]
+    data_format: str
+    acceptance_criteria_per_step: list[dict[str, Any]]
+    tcle_elements: list[str]
+    lgpd_measures: list[str]
+    cep_required: bool
+    pre_collection_checklist: list[str]
+    contingency_plans: list[dict[str, Any]]
 
 
 class LiteratureReviewDoc(TypedDict, total=False):
@@ -363,6 +419,22 @@ class ResearchState(TypedDict, total=False):
     cp3_phase1_complete: bool
     cp3_preserved_sections: dict  # section_title → {"content": str, "score": float}
 
+    # Data collection guide (Checkpoint 4)
+    data_collection_guide_doc: DataCollectionGuideDoc
+    collection_guide_approved: bool
+
+    # CP4 handoff — populated by begin_collection() before CP4 graph starts.
+    # Contains a subset of research_design_doc fields needed to draft the guide:
+    # study_type, hypotheses, variables, metrics_and_kpis, data_sources,
+    # collection_protocol, instruments, sampling_strategy,
+    # sample_size_justification, ethical_considerations, data_management_plan.
+    cp4_context: dict
+
+    # CP4 convergence-preservation: sections scoring >= 0.85 in
+    # evaluate_collection_objectives, carried verbatim into the next
+    # draft_collection_guide call.
+    cp4_preserved_sections: dict  # section_title → {"content": str, "score": float}
+
     # LangGraph message history (uses add_messages reducer)
     messages: Annotated[list[BaseMessage], add_messages]
 
@@ -396,6 +468,7 @@ def initial_state(workspace_path: str, topic: str = "") -> ResearchState:
         charter_approved=False,
         literature_approved=False,
         design_approved=False,
+        collection_guide_approved=False,
         active_checkpoint=1,
         charter_document_text="",
         user_feedback=None,

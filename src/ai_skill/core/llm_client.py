@@ -176,8 +176,10 @@ class LLMClient:
     ) -> T:
         """Send a completion request and parse the response into a Pydantic model.
 
-        Uses the instructor library to enforce structured output. The LLM is
-        instructed to return JSON conforming to the model's schema.
+        Uses the raw Anthropic streaming API to avoid the "Streaming required for
+        requests > 10 minutes" rejection, then validates the complete JSON response
+        with Pydantic. The JSON schema is injected into the system prompt so the
+        model knows the exact structure expected.
 
         Args:
             messages: List of message dicts with "role" and "content" keys.
@@ -193,24 +195,49 @@ class LLMClient:
         Raises:
             LLMClientError: If the call or parsing fails after all retries.
         """
+        import json as _json
+        import re as _re
+        import pydantic
+
         tokens = max_tokens or self._max_tokens
+
+        # Inject JSON schema into the system prompt once — the model outputs raw
+        # JSON that we validate with Pydantic after the stream closes.
+        schema_str = _json.dumps(
+            response_model.model_json_schema(), ensure_ascii=False
+        )
+        json_instruction = (
+            "\n\nRespond with ONLY a valid JSON object that matches this JSON Schema "
+            "(no markdown fences, no explanatory text before or after):\n" + schema_str
+        )
+        full_system = (system + json_instruction) if system else json_instruction.lstrip()
+
+        stream_kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": tokens,
+            "messages": messages,
+            "system": full_system,
+        }
+        if temperature is not None:
+            stream_kwargs["temperature"] = temperature
 
         for attempt in range(_MAX_RETRIES):
             try:
-                kwargs: dict[str, Any] = {
-                    "model": self._model,
-                    "max_tokens": tokens,
-                    "messages": messages,
-                    "response_model": response_model,
-                }
-                if system:
-                    kwargs["system"] = system
-                if temperature is not None:
-                    kwargs["temperature"] = temperature
+                # Stream the response to avoid Anthropic's 10-minute non-streaming
+                # limit. get_final_text() waits for the stream to close and returns
+                # the complete assistant text — no partial-model issues.
+                with self._raw_client.messages.stream(**stream_kwargs) as stream:
+                    full_text = stream.get_final_text()
 
-                result = self._instructor_client.messages.create(**kwargs)  # type: ignore[return-value]
+                # Strip markdown code fences the model may add despite instructions.
+                text = full_text.strip()
+                text = _re.sub(r"^```(?:json)?\s*\n?", "", text)
+                text = _re.sub(r"\n?```\s*$", "", text)
+                text = text.strip()
+
+                result: T = response_model.model_validate_json(text)
+
                 try:
-                    import json as _json
                     from ai_skill.core import history as _hist
                     _hist.log_llm_call(
                         system=system,
@@ -233,9 +260,21 @@ class LLMClient:
                     delay,
                 )
                 time.sleep(delay)
+            except (pydantic.ValidationError, ValueError) as exc:
+                # JSON / schema mismatch — retry; the model may self-correct.
+                if attempt < _MAX_RETRIES - 1:
+                    logger.warning(
+                        "Structured output validation failed (attempt %d/%d): %s — retrying.",
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        str(exc)[:200],
+                    )
+                    continue
+                raise LLMClientError(
+                    f"Structured completion failed after {_MAX_RETRIES} attempts: "
+                    f"{str(exc)[:300]}"
+                ) from exc
             except Exception as exc:
-                # Truncate the exception string — raw instructor/Anthropic
-                # Message objects can be thousands of chars and flood the log.
                 exc_summary = str(exc)[:300]
                 raise LLMClientError(
                     f"Structured completion failed: {exc_summary}"
