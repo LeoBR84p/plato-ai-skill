@@ -947,7 +947,7 @@ def compile_literature(
             response_model=_LiteratureReviewLLM,
             system=system,
             temperature=0.3,
-            max_tokens=16384,
+            max_tokens=32768,
         )
     except LLMClientError as exc:
         logger.error("Literature review compilation failed: %s", exc)
@@ -1285,7 +1285,7 @@ def refine_literature(
             response_model=_LiteratureReviewLLM,
             system=system,
             temperature=0.3,
-            max_tokens=16384,
+            max_tokens=32768,
         )
     except LLMClientError as exc:
         logger.error("Literature review refinement failed: %s", exc)

@@ -224,10 +224,20 @@ class LLMClient:
         for attempt in range(_MAX_RETRIES):
             try:
                 # Stream the response to avoid Anthropic's 10-minute non-streaming
-                # limit. get_final_text() waits for the stream to close and returns
-                # the complete assistant text — no partial-model issues.
+                # limit. get_final_message() waits for the stream to close and
+                # exposes stop_reason so we can detect max_tokens truncation before
+                # attempting JSON parse (truncated JSON always fails validation).
                 with self._raw_client.messages.stream(**stream_kwargs) as stream:
-                    full_text = stream.get_final_text()
+                    final_message = stream.get_final_message()
+
+                if final_message.stop_reason == "max_tokens":
+                    raise LLMClientError(
+                        f"Response truncated: max_tokens={tokens} reached before "
+                        "JSON was complete. Increase max_tokens or reduce prompt size."
+                    )
+
+                first_block = final_message.content[0] if final_message.content else None
+                full_text = first_block.text if hasattr(first_block, "text") else ""
 
                 # Strip markdown code fences the model may add despite instructions.
                 text = full_text.strip()
