@@ -267,16 +267,10 @@ class LLMClient:
         )
         full_system = (system + json_instruction) if system else json_instruction.lstrip()
 
-        # Assistant prefill forces the model to start its response with "{", making
-        # it impossible to output plain text before the JSON object.  The Anthropic
-        # streaming API returns only the *continuation* after the prefill, so we
-        # prepend "{" ourselves when assembling the final text.
-        messages_with_prefill = list(messages) + [{"role": "assistant", "content": "{"}]
-
         stream_kwargs: dict[str, Any] = {
             "model": self._model,
             "max_tokens": tokens,
-            "messages": messages_with_prefill,
+            "messages": messages,
             "system": full_system,
         }
         if temperature is not None:
@@ -298,11 +292,9 @@ class LLMClient:
                     )
 
                 first_block = final_message.content[0] if final_message.content else None
-                continuation = first_block.text if hasattr(first_block, "text") else ""
+                full_text = first_block.text if hasattr(first_block, "text") else ""
 
-                # Prepend the prefill "{" that the API strips from the continuation,
-                # then clean any markdown fences the model may still add.
-                full_text = "{" + continuation
+                # Strip markdown code fences the model may add despite instructions.
                 text = full_text.strip()
                 text = _re.sub(r"^```(?:json)?\s*\n?", "", text)
                 text = _re.sub(r"\n?```\s*$", "", text)
