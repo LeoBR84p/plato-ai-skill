@@ -82,6 +82,9 @@ _CONVERGENCE_THRESHOLD = float(
     os.environ.get("AI_SKILL_CONVERGENCE_THRESHOLD", "0.75")
 )
 
+_CHUNK_FINDINGS_SIZE = 13   # max findings per chunk call
+_CHUNK_SECTIONS_PER_GROUP = 2  # sections per outline group (target)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models for structured LLM outputs
@@ -177,6 +180,50 @@ class _LiteratureReviewLLM(BaseModel):
     references: list[_LiteratureSourceLLM] = Field(
         min_length=1,
         description="Numbered bibliography (must match all [N] used in sections).",
+    )
+
+
+class _SectionGroupLLM(BaseModel):
+    """One group of thematically cohesive sections for chunked compilation."""
+    titles: list[str] = Field(description="2–3 section titles (pt-BR) for this chunk.")
+    themes: list[str] = Field(description="3–6 keywords summarising the themes of this group.")
+
+
+class _OutlineLLM(BaseModel):
+    """Outline plan for chunked literature compilation."""
+    section_groups: list[_SectionGroupLLM] = Field(
+        min_length=1,
+        description="Ordered list of section groups; each group becomes one chunk call.",
+    )
+
+
+class _LiteratureChunkLLM(BaseModel):
+    """One compiled chunk of the literature review (2–3 sections + new references)."""
+
+    sections: list[_LiteratureReviewSectionLLM] = Field(
+        min_length=1,
+        description="Sections generated for this chunk.",
+    )
+    new_references: list[_LiteratureSourceLLM] = Field(
+        default_factory=list,
+        description=(
+            "Only NEW references introduced in this chunk "
+            "(not already cited in prior chunks). Numbered from ref_offset."
+        ),
+    )
+
+
+class _ReferenceContributionItemLLM(BaseModel):
+    """Marginal contribution score for one reference."""
+    url: str = Field(description="URL of the reference (must match the provided list).")
+    contribution: float = Field(description="Marginal contribution score 0.0–1.0.")
+
+
+class _ReferenceContributionLLM(BaseModel):
+    """Collection of contribution scores for newly added references."""
+    contributions: list[_ReferenceContributionItemLLM] = Field(
+        default_factory=list,
+        description="One entry per new reference.",
     )
 
 
@@ -694,6 +741,78 @@ def execute(
     }
 
 
+def _estimate_reference_contributions(
+    llm: "LLMClient",
+    state: "ResearchState",
+    prev_score: float,
+    new_score: float,
+    prev_doc: dict,
+    current_doc: dict,
+) -> dict[str, float]:
+    """Estimate the marginal contribution of new references to a score improvement.
+
+    Identifies references present in current_doc but absent from prev_doc,
+    then asks the LLM to score each one's contribution to the quality delta.
+
+    Args:
+        llm: LLMClient instance.
+        state: Current ResearchState (for charter goals and evaluation gaps).
+        prev_score: Quality score of the previous best document.
+        new_score: Quality score of the current (new best) document.
+        prev_doc: Previous best LiteratureReviewDoc.
+        current_doc: Current LiteratureReviewDoc.
+
+    Returns:
+        dict mapping reference URL → estimated contribution score (0.0–1.0).
+    """
+    from ai_skill.prompts.literature import build_contribution_messages
+
+    # Identify new references not present in prev_doc
+    prev_urls: set[str] = {
+        (r.get("url") or "").lower().strip()
+        for r in prev_doc.get("references", [])
+        if r.get("url")
+    }
+    new_refs: list[dict] = [
+        r for r in current_doc.get("references", [])
+        if (r.get("url") or "").lower().strip() not in prev_urls
+    ]
+
+    if not new_refs:
+        return {}
+
+    # Collect context for the contribution prompt
+    objective = state.get("cp2_context") or state.get("objective") or {}
+    charter_goals: list[str] = list(objective.get("goals") or [])
+    evaluation: dict = state.get("evaluation") or {}
+    prev_gaps: list[str] = list(evaluation.get("gaps") or [])
+
+    system, messages = build_contribution_messages(
+        charter_goals=charter_goals,
+        prev_gaps=prev_gaps,
+        new_references=new_refs,
+        prev_score=prev_score,
+        new_score=new_score,
+    )
+    try:
+        result: _ReferenceContributionLLM = llm.complete_structured(
+            messages=messages,
+            response_model=_ReferenceContributionLLM,
+            system=system,
+            temperature=0.0,
+            max_tokens=2048,
+        )
+    except LLMClientError as exc:
+        logger.warning("Reference contribution LLM call failed: %s", exc)
+        return {}
+
+    return {
+        item.url.lower().strip(): float(item.contribution)
+        for item in result.contributions
+        if item.url
+    }
+
+
 def evaluate(
     state: ResearchState,
     llm: LLMClient | None = None,
@@ -816,12 +935,56 @@ def evaluate(
             attempt,
         )
 
+    # ── CP2 anti-regression + incremental accumulation ────────────────────
+    # Only active during LITERATURE_REVIEW stage to avoid interfering with CP3+.
+    extra_updates: dict[str, Any] = {}
+    if stage_str == PipelineStage.LITERATURE_REVIEW.value:
+        best_score = float(state.get("cp2_best_score") or 0.0)
+        current_doc = state.get("literature_review_doc")
+        prev_best_doc: dict | None = state.get("cp2_best_doc")
+
+        if total_score > best_score and current_doc and current_doc.get("sections"):
+            # New best achieved — update best_doc and estimate reference contributions.
+            extra_updates["cp2_best_doc"] = current_doc
+            extra_updates["cp2_best_score"] = total_score
+            logger.info(
+                "CP2 new best: %.2f → %.2f (attempt %d)",
+                best_score, total_score, attempt,
+            )
+
+            # Compute marginal contribution of NEW references (only when improving).
+            if best_score > 0.0 and prev_best_doc:
+                try:
+                    ref_scores = _estimate_reference_contributions(
+                        llm=_llm,
+                        state=state,
+                        prev_score=best_score,
+                        new_score=total_score,
+                        prev_doc=prev_best_doc,
+                        current_doc=current_doc,
+                    )
+                    merged_scores = dict(state.get("cp2_reference_scores") or {})
+                    merged_scores.update(ref_scores)
+                    extra_updates["cp2_reference_scores"] = merged_scores
+                except Exception as exc:
+                    logger.warning("Reference contribution estimation failed: %s", exc)
+
+        elif prev_best_doc and total_score < best_score - 0.01:
+            # Score regressed — silently revert to the best known doc so the next
+            # compile_literature starts from a better base.
+            logger.warning(
+                "CP2 regression %.2f → %.2f — reverting literature_review_doc to best (%.2f)",
+                previous_score or 0.0, total_score, best_score,
+            )
+            extra_updates["literature_review_doc"] = prev_best_doc
+
     return {
         "evaluation": evaluation,
         "attempt": attempt + 1,
         "quality_history": quality_history + [snapshot],
         "stage_quality_history": stage_quality_history,
         "status": ResearchStatus.CONVERGED if converged else ResearchStatus.EXECUTING,
+        **extra_updates,
     }
 
 
@@ -871,6 +1034,181 @@ def request_support(state: ResearchState) -> dict[str, Any]:
 # Checkpoint 2 — Literature Review nodes
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CP2 chunked compilation helpers
+# ---------------------------------------------------------------------------
+
+import json
+
+
+def _canonical_ref_url(ref: dict) -> str:
+    """Return a canonical deduplication key for a reference dict."""
+    url = (ref.get("url") or "").strip().rstrip("/")
+    if url:
+        return url.lower()
+    return (ref.get("title") or "").lower().strip()
+
+
+def _select_chunk_findings(
+    findings: list[dict],
+    themes: list[str],
+    used_limit: int = _CHUNK_FINDINGS_SIZE,
+) -> list[dict]:
+    """Select the most theme-relevant findings for a chunk."""
+    if not themes:
+        return findings[:used_limit]
+
+    def _relevance(f: dict) -> int:
+        text = json.dumps(f, ensure_ascii=False).lower()
+        return sum(1 for kw in themes if kw.lower() in text)
+
+    ranked = sorted(findings, key=_relevance, reverse=True)
+    return ranked[:used_limit]
+
+
+def _compile_literature_chunked(
+    llm: "LLMClient",
+    charter_document_text: str,
+    findings_summary: list[dict],
+    best_doc: dict | None = None,
+) -> "_LiteratureReviewLLM":
+    """Compile a literature review in multiple chunks to avoid max_tokens limits.
+
+    Strategy:
+    1. Outline pass (1 call): plan N section groups with themes.
+    2. Chunk pass (N calls): generate 2–3 sections per group with offset-numbered refs.
+    3. Python merge: concatenate sections, deduplicate references.
+
+    Args:
+        llm: LLMClient instance.
+        charter_document_text: CP1 charter text.
+        findings_summary: Pre-built findings summary list.
+        best_doc: Previous best LiteratureReviewDoc (used as seed context if provided).
+
+    Returns:
+        A _LiteratureReviewLLM instance ready for post-processing.
+    """
+    from ai_skill.prompts.literature import (
+        build_outline_messages,
+        build_chunk_messages,
+    )
+
+    num_chunks = max(2, (len(findings_summary) + _CHUNK_FINDINGS_SIZE - 1) // _CHUNK_FINDINGS_SIZE)
+
+    # ── Phase 1: Outline ──────────────────────────────────────────────────
+    finding_titles: list[str] = []
+    for f in findings_summary:
+        for p in (f.get("papers") or []):
+            title = p.get("title") or ""
+            if title:
+                finding_titles.append(title)
+        if f.get("skill_name") == "content_summarizer":
+            finding_titles.append((f.get("summary") or "")[:80])
+
+    system, messages = build_outline_messages(
+        charter_document_text=charter_document_text,
+        finding_titles=finding_titles,
+        num_chunks=num_chunks,
+    )
+    try:
+        outline: _OutlineLLM = llm.complete_structured(
+            messages=messages,
+            response_model=_OutlineLLM,
+            system=system,
+            max_tokens=2048,
+        )
+    except LLMClientError as exc:
+        logger.warning("Outline phase failed (%s) — falling back to even split", exc)
+        # Fallback: create equal groups without thematic assignment
+        section_titles_fallback = [
+            f"Seção {i + 1}" for i in range(num_chunks * _CHUNK_SECTIONS_PER_GROUP)
+        ]
+        groups = [
+            _SectionGroupLLM(
+                titles=section_titles_fallback[i : i + _CHUNK_SECTIONS_PER_GROUP],
+                themes=[],
+            )
+            for i in range(0, len(section_titles_fallback), _CHUNK_SECTIONS_PER_GROUP)
+        ]
+        outline = _OutlineLLM(section_groups=groups)
+
+    # If best_doc has refs, start global_refs with them so chunks can cite them
+    global_refs: list[dict] = []  # list of reference dicts (already numbered)
+    seen_url_keys: set[str] = set()
+
+    if best_doc:
+        for ref in best_doc.get("references", []):
+            key = _canonical_ref_url(ref)
+            if key and key not in seen_url_keys:
+                seen_url_keys.add(key)
+                global_refs.append(ref)
+
+    all_sections: list[_LiteratureReviewSectionLLM] = []
+
+    # ── Phase 2: Chunk generation ─────────────────────────────────────────
+    for group in outline.section_groups:
+        chunk_findings = _select_chunk_findings(findings_summary, group.themes)
+        ref_offset = len(global_refs) + 1
+
+        chunk_system, chunk_messages = build_chunk_messages(
+            charter_document_text=charter_document_text,
+            section_titles=group.titles,
+            findings=chunk_findings,
+            already_cited=global_refs,
+            ref_offset=ref_offset,
+        )
+        try:
+            chunk: _LiteratureChunkLLM = llm.complete_structured(
+                messages=chunk_messages,
+                response_model=_LiteratureChunkLLM,
+                system=chunk_system,
+                max_tokens=16384,
+            )
+        except LLMClientError as exc:
+            logger.warning(
+                "Chunk '%s' failed (%s) — skipping",
+                ", ".join(group.titles),
+                exc,
+            )
+            continue
+
+        all_sections.extend(chunk.sections)
+
+        # Merge new references, deduplicating by canonical URL
+        for ref in chunk.new_references:
+            key = _canonical_ref_url({"url": ref.url, "title": ref.title})
+            if key and key not in seen_url_keys:
+                seen_url_keys.add(key)
+                # Convert _LiteratureSourceLLM → dict for global_refs
+                global_refs.append({
+                    "reference_number": ref.reference_number,
+                    "title": ref.title,
+                    "authors": ref.authors,
+                    "year": ref.year,
+                    "url": ref.url,
+                    "abnt_entry": ref.abnt_entry,
+                    "summary": ref.summary,
+                })
+
+    if not all_sections:
+        raise LLMClientError("Chunked compilation produced no sections.")
+
+    # ── Phase 3: Rebuild final _LiteratureReviewLLM ───────────────────────
+    final_sources = [
+        _LiteratureSourceLLM(
+            reference_number=r.get("reference_number", i + 1),
+            title=r.get("title", ""),
+            authors=r.get("authors", ""),
+            year=str(r.get("year", "")),
+            url=r.get("url", ""),
+            abnt_entry=r.get("abnt_entry", ""),
+            summary=r.get("summary", ""),
+        )
+        for i, r in enumerate(global_refs)
+    ]
+
+    return _LiteratureReviewLLM(sections=all_sections, references=final_sources)
+
 
 def compile_literature(
     state: ResearchState,
@@ -896,7 +1234,29 @@ def compile_literature(
 
     # Sort by confidence (desc) and take top 40 to prevent token overflow.
     # Uses all accumulated findings (not just current attempt) for richer compilation.
-    sorted_findings = sorted(findings, key=lambda f: f.get("confidence", 0.0), reverse=True)
+    # Build reference scores index from cp2_reference_scores (url → contribution score).
+    # This boosts findings that previously produced high-contribution references so that
+    # incremental iterations keep improving on the best result.
+    ref_scores: dict[str, float] = dict(state.get("cp2_reference_scores") or {})
+    best_doc_refs: set[str] = set()
+    best_doc: dict | None = state.get("cp2_best_doc")
+    if best_doc:
+        for r in best_doc.get("references", []):
+            u = (r.get("url") or "").strip().lower()
+            if u:
+                best_doc_refs.add(u)
+
+    def _finding_priority(f: dict) -> float:
+        """Combine confidence + max marginal contribution score for contained papers."""
+        base = float(f.get("confidence", 0.0))
+        bonus = 0.0
+        for p in (f.get("papers") or []):
+            url = (p.get("url") or p.get("doi") or "").lower()
+            if url in ref_scores:
+                bonus = max(bonus, ref_scores[url])
+        return base + bonus * 0.5  # blend: confidence + half the contribution bonus
+
+    sorted_findings = sorted(findings, key=_finding_priority, reverse=True)
     top_findings = sorted_findings[:40]
 
     findings_summary: list[dict[str, Any]] = []
@@ -941,17 +1301,44 @@ def compile_literature(
         findings=findings_summary,
     )
 
+    # Attempt 1: single call with full max_tokens ceiling (64 000 is the API max for this model).
+    # If the response is truncated (max_tokens hit), fall back to chunked compilation.
+    review_obj: _LiteratureReviewLLM | None = None
     try:
-        review_obj: _LiteratureReviewLLM = _llm.complete_structured(
+        review_obj = _llm.complete_structured(
             messages=messages,
             response_model=_LiteratureReviewLLM,
             system=system,
             temperature=0.3,
-            max_tokens=32768,
+            max_tokens=64000,
         )
     except LLMClientError as exc:
-        logger.error("Literature review compilation failed: %s", exc)
-        return {"status": ResearchStatus.FAILED, "literature_review_doc": LiteratureReviewDoc(sections=[], references=[], verified_sources=[])}
+        if "max_tokens" in str(exc).lower() or "truncat" in str(exc).lower():
+            logger.warning(
+                "Single compilation hit max_tokens — switching to chunked mode (%d findings)",
+                len(top_findings),
+            )
+            try:
+                review_obj = _compile_literature_chunked(
+                    llm=_llm,
+                    charter_document_text=charter_document_text,
+                    findings_summary=findings_summary,
+                    best_doc=state.get("cp2_best_doc"),
+                )
+            except LLMClientError as chunk_exc:
+                logger.error("Chunked compilation also failed: %s", chunk_exc)
+                return {
+                    "status": ResearchStatus.FAILED,
+                    "active_checkpoint": 2,
+                    "literature_review_doc": LiteratureReviewDoc(sections=[], references=[], verified_sources=[]),
+                }
+        else:
+            logger.error("Literature review compilation failed: %s", exc)
+            return {
+                "status": ResearchStatus.FAILED,
+                "active_checkpoint": 2,
+                "literature_review_doc": LiteratureReviewDoc(sections=[], references=[], verified_sources=[]),
+            }
 
     sections: list[LiteratureReviewSection] = [
         LiteratureReviewSection(section_title=s.section_title, content=s.content)
@@ -1212,7 +1599,7 @@ def deliver_literature(state: ResearchState) -> dict[str, Any]:
 
     if not review_doc.get("sections"):
         logger.warning("deliver_literature: empty review doc — skipping docx generation.")
-        return {"checkpoint_label": "", "literature_approved": False, "status": ResearchStatus.FAILED}
+        return {"checkpoint_label": "", "literature_approved": False, "status": ResearchStatus.FAILED, "active_checkpoint": 2}
 
     if workspace_path:
         docx_bytes = _literature_review_to_docx(review_doc)
@@ -2389,18 +2776,68 @@ def evaluate_objectives(
         regression=regression,
     )
 
-    # Preserve sections that scored >= 0.85 for the next ideation iteration
+    # Build section content lookup from the current design doc
     design_sections: list[dict[str, Any]] = (design_doc.get("sections") or [])
     section_content_by_title: dict[str, str] = {
         s.get("section_title", ""): s.get("content", "")
         for s in design_sections
     }
-    preserved: dict[str, Any] = {}
+
+    # ── CP3 anti-regression + per-section historical best tracking ────────
+    #
+    # cp3_best_section_scores tracks the highest score ever achieved for each
+    # section title across all attempts. cp3_preserved_sections is rebuilt from
+    # these historical bests every evaluation, so:
+    #   (a) a section that scores 0.83 in attempt 1 and 0.70 in attempt 2 keeps
+    #       its 0.83 content instead of being silently downgraded, and
+    #   (b) the threshold for preservation shifts from the hard ≥0.85 cutoff to
+    #       "any improvement over the historical best".
+    #
+    # cp3_best_doc / cp3_best_score track the document with the highest total_score.
+    # When a retry regresses, research_design_doc is reverted to the best doc so
+    # ideate_design always starts from the strongest known base.
+
+    best_section_scores: dict[str, Any] = dict(state.get("cp3_best_section_scores") or {})
+
     for s in eval_obj.sections:
-        if s.score >= 0.85:
+        current_score = s.score
+        prev_best = best_section_scores.get(s.section_title, {})
+        prev_best_score = float(prev_best.get("score", 0.0))
+        if current_score > prev_best_score:
             content = section_content_by_title.get(s.section_title, "")
             if content:
-                preserved[s.section_title] = {"content": content, "score": s.score}
+                best_section_scores[s.section_title] = {
+                    "content": content,
+                    "score": current_score,
+                }
+    # Rebuild cp3_preserved_sections from historical bests.
+    # Preserve every section that has ever reached ≥0.85 (verbatim in next call)
+    # AND any section whose historical best is the best we have seen
+    # (even if below 0.85 — prevents silent regressions on partially-good sections).
+    preserved: dict[str, Any] = {}
+    for title, best in best_section_scores.items():
+        if best.get("score", 0.0) >= 0.85:
+            preserved[title] = best
+
+    # ── Total-doc anti-regression ─────────────────────────────────────────
+    cp3_best_score = float(state.get("cp3_best_score") or 0.0)
+    extra_updates: dict[str, Any] = {"cp3_best_section_scores": best_section_scores}
+
+    if total_score > cp3_best_score and design_doc.get("sections"):
+        extra_updates["cp3_best_doc"] = design_doc
+        extra_updates["cp3_best_score"] = total_score
+        logger.info(
+            "CP3 new best total score: %.2f → %.2f (attempt %d)",
+            cp3_best_score, total_score, attempt,
+        )
+    elif state.get("cp3_best_doc") and total_score < cp3_best_score - 0.01:
+        # Revert the design doc to the best known version so the next
+        # ideate_design call starts from a stronger base.
+        logger.warning(
+            "CP3 regression %.2f → %.2f — reverting research_design_doc to best (%.2f)",
+            previous_score or 0.0, total_score, cp3_best_score,
+        )
+        extra_updates["research_design_doc"] = state["cp3_best_doc"]
 
     snapshot = QualitySnapshot(
         attempt=attempt,
@@ -2429,6 +2866,7 @@ def evaluate_objectives(
         "quality_history": new_quality_history,
         "stage_quality_history": stage_quality_history,
         "status": ResearchStatus.PLANNING,
+        **extra_updates,
     }
 
 

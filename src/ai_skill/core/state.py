@@ -385,6 +385,15 @@ class ResearchState(TypedDict, total=False):
     literature_approved: bool
     active_checkpoint: int
     literature_review_doc: LiteratureReviewDoc
+    # CP2 anti-regression: best achieved doc + per-reference marginal contribution scores.
+    # cp2_best_doc holds the LiteratureReviewDoc that produced the highest total_score so far.
+    # cp2_best_score is its corresponding total_score.
+    # cp2_reference_scores maps reference URL → marginal contribution score (0.0–1.0), computed
+    # each time a new doc improves on the previous best. Used in compile_literature to
+    # prioritise findings that previously contributed most to quality.
+    cp2_best_doc: LiteratureReviewDoc
+    cp2_best_score: float
+    cp2_reference_scores: dict[str, float]  # url → marginal contribution (0.0–1.0)
     charter_document_text: str  # extracted text of CP1 [final].docx — CP2 context
 
     # Research design (Checkpoint 3)
@@ -413,11 +422,20 @@ class ResearchState(TypedDict, total=False):
     # CP3 4-phase pipeline state
     # cp3_phase1_complete: True after read_attachments runs; prevents re-reading
     #   on retry iterations within the same graph execution.
-    # cp3_preserved_sections: sections that scored >= 0.85 in evaluate_objectives
-    #   and must be carried verbatim into the next ideate_design call.
+    # cp3_preserved_sections: sections at their HISTORICAL BEST across all attempts,
+    #   injected verbatim into the next ideate_design call.
     #   Keys are section_title strings; values are dicts with 'content' and 'score'.
+    #   Upgraded from "only current-eval ≥0.85" to "historical best per section"
+    #   so regressions on individual sections are automatically reverted.
+    # cp3_best_doc / cp3_best_score: the ResearchDesignDoc that produced the highest
+    #   total_score so far; restored automatically when a retry regresses.
+    # cp3_best_section_scores: historical best score achieved per section title,
+    #   used to detect per-section regressions and update cp3_preserved_sections.
     cp3_phase1_complete: bool
-    cp3_preserved_sections: dict  # section_title → {"content": str, "score": float}
+    cp3_preserved_sections: dict       # section_title → {"content": str, "score": float}
+    cp3_best_doc: ResearchDesignDoc    # design doc with highest total_score so far
+    cp3_best_score: float              # total_score of cp3_best_doc
+    cp3_best_section_scores: dict      # section_title → {"content": str, "score": float}
 
     # Data collection guide (Checkpoint 4)
     data_collection_guide_doc: DataCollectionGuideDoc

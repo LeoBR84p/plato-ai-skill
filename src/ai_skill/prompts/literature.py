@@ -222,3 +222,204 @@ def build_refine_messages(
         feedback=feedback,
     )
     return REFINE_SYSTEM, [{"role": "user", "content": user_content}]
+
+
+# ---------------------------------------------------------------------------
+# OUTLINE — plan section groups for chunked compilation
+# ---------------------------------------------------------------------------
+
+OUTLINE_SYSTEM = """\
+You are a senior academic researcher planning the structure of a literature review
+written in Brazilian Portuguese. Based on the research charter and the available
+findings, design a coherent thematic structure split into groups of 2–3 sections each.
+
+RULES:
+- Total sections: 5–8 (never fewer, never more)
+- Each group covers 2–3 thematically cohesive sections
+- Section titles must be in pt-BR, concise (4–8 words), and non-overlapping
+- group_themes: 3–6 keywords summarising what to look for in findings for that group
+- Sections must collectively cover the full intellectual landscape of the charter goals
+
+Respond ONLY with valid JSON matching the schema provided.
+"""
+
+OUTLINE_USER = """\
+════════════════════════════════════════
+CHECKPOINT 1 — Research Charter (resumo)
+════════════════════════════════════════
+{charter_document_text}
+
+════════════════════════════════════════
+Findings disponíveis (títulos para contexto)
+════════════════════════════════════════
+{finding_titles}
+
+════════════════════════════════════════
+Design a estrutura da revisão bibliográfica em {num_chunks} grupo(s) de seções,
+onde cada grupo será compilado independentemente. Grupos devem ser temáticamente
+distintos e não sobrepostos.
+"""
+
+
+def build_outline_messages(
+    charter_document_text: str,
+    finding_titles: list[str],
+    num_chunks: int,
+) -> tuple[str, list[dict[str, str]]]:
+    """Build messages for the outline phase of chunked compilation."""
+    titles_text = "\n".join(f"- {t}" for t in finding_titles[:60])
+    user_content = OUTLINE_USER.format(
+        charter_document_text=(charter_document_text or "")[:4000],
+        finding_titles=titles_text,
+        num_chunks=num_chunks,
+    )
+    return OUTLINE_SYSTEM, [{"role": "user", "content": user_content}]
+
+
+# ---------------------------------------------------------------------------
+# COMPILE_CHUNK — generate 2–3 sections from a subset of findings
+# ---------------------------------------------------------------------------
+
+COMPILE_CHUNK_SYSTEM = """\
+You are a senior academic researcher writing part of a literature review in Brazilian Portuguese.
+You will receive:
+  1. A subset of research findings to incorporate
+  2. A list of section titles YOUR CHUNK must produce (2–3 sections)
+  3. References already cited in PREVIOUS chunks (with their global [N] numbers)
+
+RULES:
+- Write ONLY the sections listed in SECTION_TITLES_TO_GENERATE — no more, no less
+- Every factual claim must end with an inline citation [N]
+- For references ALREADY CITED in prior chunks: use their existing [N] number directly
+- For NEW references (not in prior list): include them in new_references numbered from ref_offset
+- Do NOT repeat in new_references any reference that appears in ALREADY_CITED_REFERENCES
+- Summaries in new_references: 300–500 words covering main argument, methodology,
+  key findings, conclusions, and relevance — based solely on the provided findings
+- Language: pt-BR, academic register, ABNT NBR 6023:2018 for reference entries
+- No fabrication: use only information present in the provided findings
+
+Respond ONLY with valid JSON matching the schema provided.
+"""
+
+COMPILE_CHUNK_USER = """\
+════════════════════════════════════════
+CHECKPOINT 1 — Research Charter (resumo)
+════════════════════════════════════════
+{charter_document_text}
+
+════════════════════════════════════════
+SECTION_TITLES_TO_GENERATE (escreva EXATAMENTE estas seções, nesta ordem)
+════════════════════════════════════════
+{section_titles}
+
+════════════════════════════════════════
+ALREADY_CITED_REFERENCES (use estes números ao citar — NÃO inclua em new_references)
+════════════════════════════════════════
+{already_cited}
+
+════════════════════════════════════════
+Findings para incorporar neste chunk (suas novas referências começam em [{ref_offset}])
+════════════════════════════════════════
+{findings_json}
+
+Gere as seções listadas acima. Cite fontes já incluídas pelos seus [N] existentes.
+Novas fontes começam em [{ref_offset}]. Inclua em new_references SOMENTE referências novas.
+"""
+
+
+def build_chunk_messages(
+    charter_document_text: str,
+    section_titles: list[str],
+    findings: list[dict],
+    already_cited: list[dict],
+    ref_offset: int,
+) -> tuple[str, list[dict[str, str]]]:
+    """Build messages for one section chunk in chunked compilation."""
+    import json as _json
+
+    titles_text = "\n".join(f"- {t}" for t in section_titles)
+    cited_text = "\n".join(
+        f"[{r.get('reference_number', '?')}] {r.get('authors', '')} ({r.get('year', '')}). {r.get('title', '')}."
+        for r in already_cited
+    ) or "(nenhuma — este é o primeiro chunk)"
+
+    user_content = COMPILE_CHUNK_USER.format(
+        charter_document_text=(charter_document_text or "")[:4000],
+        section_titles=titles_text,
+        already_cited=cited_text,
+        ref_offset=ref_offset,
+        findings_json=_json.dumps(findings, ensure_ascii=False, indent=2),
+    )
+    return COMPILE_CHUNK_SYSTEM, [{"role": "user", "content": user_content}]
+
+
+# ---------------------------------------------------------------------------
+# REFERENCE_CONTRIBUTION — LLM estimates marginal contribution of new references
+# ---------------------------------------------------------------------------
+
+REFERENCE_CONTRIBUTION_SYSTEM = """\
+You are a literature quality assessor. Your task is to estimate how much each NEW
+reference contributed to a quality improvement in a literature review, on a 0.0–1.0 scale.
+
+Context: A literature review was revised and its quality score improved from {prev_score:.2f}
+to {new_score:.2f} (scale 0.0–1.0). The improvement came from adding new references.
+
+For each new reference, estimate its marginal contribution:
+  1.0 — this reference alone likely caused most of the improvement (central, unique insight)
+  0.7 — significant contribution (important empirical evidence or key theoretical concept)
+  0.4 — moderate contribution (supporting evidence, corroborative)
+  0.1 — minor contribution (peripheral, tangential to the research goals)
+  0.0 — no visible contribution (not cited or irrelevant)
+
+Base your assessment on:
+- How well the reference aligns with the research charter goals
+- Whether it fills a gap mentioned in the evaluation
+- Whether the section content that cites it is in a high-scoring area
+
+Respond ONLY with valid JSON matching the schema provided.
+"""
+
+REFERENCE_CONTRIBUTION_USER = """\
+════════════════════════════════════════
+Research Charter goals (for relevance assessment)
+════════════════════════════════════════
+{charter_goals}
+
+════════════════════════════════════════
+Evaluation gaps from PREVIOUS iteration (what was missing)
+════════════════════════════════════════
+{prev_gaps}
+
+════════════════════════════════════════
+NEW references added in this iteration (estimate each one's marginal contribution)
+════════════════════════════════════════
+{new_references_json}
+
+For each reference, return its URL and an estimated contribution score (0.0–1.0).
+"""
+
+
+def build_contribution_messages(
+    charter_goals: list[str],
+    prev_gaps: list[str],
+    new_references: list[dict],
+    prev_score: float,
+    new_score: float,
+) -> tuple[str, list[dict[str, str]]]:
+    """Build messages for the reference contribution estimation call."""
+    import json as _json
+
+    system = REFERENCE_CONTRIBUTION_SYSTEM.format(
+        prev_score=prev_score,
+        new_score=new_score,
+    )
+    user_content = REFERENCE_CONTRIBUTION_USER.format(
+        charter_goals="\n".join(f"- {g}" for g in charter_goals),
+        prev_gaps="\n".join(f"- {g}" for g in prev_gaps) or "(none recorded)",
+        new_references_json=_json.dumps(
+            [{"url": r.get("url", ""), "title": r.get("title", ""), "summary": (r.get("summary") or "")[:200]}
+             for r in new_references],
+            ensure_ascii=False, indent=2
+        ),
+    )
+    return system, [{"role": "user", "content": user_content}]
