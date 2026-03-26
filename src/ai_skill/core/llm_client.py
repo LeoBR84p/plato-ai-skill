@@ -47,6 +47,61 @@ class LLMClientError(Exception):
     """Raised when the LLM client fails after all retries."""
 
 
+def _extract_and_validate(text: str, model: type[T]) -> T:
+    """Try to parse *text* as JSON for *model*, with progressive fallbacks.
+
+    Fallback chain (each step only runs if the previous raised):
+    1. Direct parse — text is already valid JSON.
+    2. Substring extraction — find the outermost ``{…}`` block and parse that.
+       Handles preamble/postamble text the model added despite instructions.
+    3. Light sanitisation — fix typographic quotes and trailing commas, then
+       re-attempt parse on both the full text and the extracted substring.
+
+    Raises ``pydantic.ValidationError`` if all attempts fail so the caller's
+    retry loop can decide what to do next.
+    """
+    import json as _json
+    import re as _re
+    import pydantic
+
+    def _try(candidate: str) -> T | None:
+        try:
+            return model.model_validate_json(candidate)
+        except (pydantic.ValidationError, ValueError):
+            return None
+
+    # 1. Direct
+    result = _try(text)
+    if result is not None:
+        return result
+
+    # 2. Extract outermost {…} block (handles preamble / trailing text)
+    match = _re.search(r"\{.*\}", text, _re.DOTALL)
+    extracted = match.group(0) if match else None
+    if extracted and extracted != text:
+        result = _try(extracted)
+        if result is not None:
+            logger.debug("_extract_and_validate: recovered JSON via substring extraction.")
+            return result
+
+    # 3. Light sanitisation: typographic quotes → straight quotes, trailing commas
+    def _sanitise(s: str) -> str:
+        s = s.replace("\u201c", '"').replace("\u201d", '"')   # " "
+        s = s.replace("\u2018", "'").replace("\u2019", "'")   # ' '
+        s = _re.sub(r",\s*([}\]])", r"\1", s)                # trailing commas
+        return s
+
+    for candidate in filter(None, [_sanitise(text), _sanitise(extracted) if extracted else None]):
+        result = _try(candidate)
+        if result is not None:
+            logger.debug("_extract_and_validate: recovered JSON after sanitisation.")
+            return result
+
+    # All fallbacks exhausted — re-raise from a fresh parse so the caller gets
+    # a proper pydantic.ValidationError with the original text in the message.
+    return model.model_validate_json(text)
+
+
 class LLMClient:
     """Wrapper around the Anthropic SDK supporting both plain and structured calls.
 
@@ -212,10 +267,16 @@ class LLMClient:
         )
         full_system = (system + json_instruction) if system else json_instruction.lstrip()
 
+        # Assistant prefill forces the model to start its response with "{", making
+        # it impossible to output plain text before the JSON object.  The Anthropic
+        # streaming API returns only the *continuation* after the prefill, so we
+        # prepend "{" ourselves when assembling the final text.
+        messages_with_prefill = list(messages) + [{"role": "assistant", "content": "{"}]
+
         stream_kwargs: dict[str, Any] = {
             "model": self._model,
             "max_tokens": tokens,
-            "messages": messages,
+            "messages": messages_with_prefill,
             "system": full_system,
         }
         if temperature is not None:
@@ -237,15 +298,17 @@ class LLMClient:
                     )
 
                 first_block = final_message.content[0] if final_message.content else None
-                full_text = first_block.text if hasattr(first_block, "text") else ""
+                continuation = first_block.text if hasattr(first_block, "text") else ""
 
-                # Strip markdown code fences the model may add despite instructions.
+                # Prepend the prefill "{" that the API strips from the continuation,
+                # then clean any markdown fences the model may still add.
+                full_text = "{" + continuation
                 text = full_text.strip()
                 text = _re.sub(r"^```(?:json)?\s*\n?", "", text)
                 text = _re.sub(r"\n?```\s*$", "", text)
                 text = text.strip()
 
-                result: T = response_model.model_validate_json(text)
+                result: T = _extract_and_validate(text, response_model)
 
                 try:
                     from ai_skill.core import history as _hist
