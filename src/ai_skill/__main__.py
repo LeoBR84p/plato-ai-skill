@@ -2568,6 +2568,7 @@ def begin_design(
     state["literature_approved"] = True
     state["user_feedback"] = None
     state["attempt"] = 0
+    state["active_checkpoint"] = 3  # ensure interrupt handler routes to CP3 UI
 
     # Inject CP1 charter text for CP3 compile context
     final_cp1 = pw.checkpoint_final_path(1)

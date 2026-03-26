@@ -2018,6 +2018,7 @@ def deliver_design(state: ResearchState) -> dict[str, Any]:
     return {
         "checkpoint_label": checkpoint_label,
         "design_approved": False,
+        "active_checkpoint": 3,
         "status": ResearchStatus.PLANNING,
     }
 
