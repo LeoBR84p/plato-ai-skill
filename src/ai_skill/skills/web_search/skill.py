@@ -244,7 +244,7 @@ class WebSearchSkill(BaseSkill):
         data: dict[str, Any] = response.json()
 
         results: list[dict[str, str]] = []
-        for item in data.get("web", {}).get("results", []):
+        for item in (data.get("web") or {}).get("results", []):
             results.append({
                 "title": item.get("title", ""),
                 "url": item.get("url", ""),

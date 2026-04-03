@@ -7,6 +7,7 @@ makes the client injectable for testing.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import time
@@ -20,7 +21,10 @@ logger = logging.getLogger(__name__)
 
 # Node name injected by nodes.py before each LLM call so history entries
 # carry human-readable context (e.g. "plan", "evaluate", "align_charter").
-_current_node: str = ""
+# Uses contextvars for thread-safety instead of bare globals.
+_current_node_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_node_var", default=""
+)
 
 
 def set_current_node(name: str) -> None:
@@ -31,8 +35,7 @@ def set_current_node(name: str) -> None:
     Args:
         name: Node function name (e.g. "plan", "evaluate", "align_charter").
     """
-    global _current_node
-    _current_node = name
+    _current_node_var.set(name)
 
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -199,10 +202,10 @@ class LLMClient:
                         messages=messages,
                         response=text,
                         model=self._model,
-                        node=_current_node,
+                        node=_current_node_var.get(),
                     )
-                except Exception:
-                    pass
+                except Exception as _hist_exc:
+                    logger.warning("History logging failed: %s", _hist_exc)
                 return text
 
             except anthropic.RateLimitError:
@@ -309,10 +312,10 @@ class LLMClient:
                         messages=messages,
                         response=_json.dumps(result.model_dump(), ensure_ascii=False),
                         model=self._model,
-                        node=_current_node,
+                        node=_current_node_var.get(),
                     )
-                except Exception:
-                    pass
+                except Exception as _hist_exc:
+                    logger.warning("History logging failed (structured): %s", _hist_exc)
                 return result
 
             except anthropic.RateLimitError:

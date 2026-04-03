@@ -869,11 +869,12 @@ def evaluate(
             system=system,
         )
     except LLMClientError as exc:
-        logger.error("Evaluation failed: %s", exc)
-        # Fail-safe: treat as not converged with empty gaps
+        logger.error("Evaluation LLM call failed (attempt %d): %s", attempt, exc)
+        # Fail-safe: treat as not converged. Preserve previous score context in gaps
+        # so the routing layer (which checks max_retries) can eventually stop the loop.
         eval_obj = _EvaluationResultLLM(
             per_metric=[],
-            gaps=[f"Evaluation error: {exc}"],
+            gaps=[f"Evaluation LLM error (attempt {attempt}): {exc}"],
         )
 
     # Compute total_score and converged deterministically in Python.
@@ -1557,14 +1558,31 @@ def verify_literature(
 
     verified: list[SourceVerification] = []
     max_workers = min(5, max(1, len(references)))
+    _VERIFY_TIMEOUT = 60  # seconds per reference verification
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_verify_one, ref): ref for ref in references}
         for future in as_completed(futures):
+            ref = futures[future]
             try:
-                verified.append(future.result())
+                verified.append(future.result(timeout=_VERIFY_TIMEOUT))
+            except TimeoutError:
+                logger.warning("Verification timed out for ref [%s]", ref.get("url", "?"))
+                verified.append(SourceVerification(
+                    url=ref.get("url", ""),
+                    title=ref.get("title", ""),
+                    accessible=False,
+                    content_matches=False,
+                    verification_note="Verification timed out",
+                ))
             except Exception as exc:
-                ref = futures[future]
                 logger.warning("Verification failed for ref [%s]: %s", ref.get("url", "?"), exc)
+                verified.append(SourceVerification(
+                    url=ref.get("url", ""),
+                    title=ref.get("title", ""),
+                    accessible=False,
+                    content_matches=False,
+                    verification_note=f"Verification error: {exc}",
+                ))
 
     review_doc["references"] = references
     review_doc["verified_sources"] = verified  # type: ignore[assignment]
@@ -2824,7 +2842,7 @@ def evaluate_objectives(
     cp3_best_score = float(state.get("cp3_best_score") or 0.0)
     extra_updates: dict[str, Any] = {"cp3_best_section_scores": best_section_scores}
 
-    if total_score > cp3_best_score and design_doc.get("sections"):
+    if (total_score > cp3_best_score or not state.get("cp3_best_doc")) and design_doc.get("sections"):
         extra_updates["cp3_best_doc"] = design_doc
         extra_updates["cp3_best_score"] = total_score
         logger.info(
@@ -3591,8 +3609,9 @@ def _fetch_url_content(url: str, timeout: int = 15) -> tuple[bool, str, str]:
 
     # ── HTML: decode and try PDF link fallback ────────────────────────────────
     try:
-        html_text = raw_bytes.decode("utf-8", errors="ignore")
-    except Exception:
+        html_text = raw_bytes.decode("utf-8", errors="ignore") if raw_bytes else ""
+    except Exception as exc:
+        logger.warning("HTML decode failed for %s: %s", url, exc)
         html_text = ""
 
     snippet = html_text[:3000]

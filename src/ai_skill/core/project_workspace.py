@@ -19,6 +19,7 @@ value of the AI_SKILL_PROJECTS_DIR environment variable.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import unicodedata
@@ -27,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Checkpoint registry
@@ -320,7 +323,11 @@ class ProjectWorkspace:
             return {}
         try:
             return yaml.safe_load(self._metadata_file.read_text(encoding="utf-8")) or {}
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "Corrupt workspace.yaml at %s: %s — returning empty metadata",
+                self._metadata_file, exc,
+            )
             return {}
 
     def update_metadata(self, updates: dict[str, Any]) -> None:

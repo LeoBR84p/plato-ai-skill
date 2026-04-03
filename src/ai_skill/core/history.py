@@ -172,7 +172,7 @@ def _append(entry: dict[str, Any]) -> None:
         with open(_log_path, "a", encoding="utf-8") as fh:
             fh.write("---\n" + text)
     except Exception as exc:
-        logger.debug("history._append failed: %s", exc)
+        logger.warning("history._append failed: %s", exc)
 
 
 def log_plan_start(

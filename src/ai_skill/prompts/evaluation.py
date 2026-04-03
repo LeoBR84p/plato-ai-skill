@@ -19,7 +19,14 @@ Para cada critério, atribua uma pontuação entre 0.0 e 1.0:
 - 0.4-0.6: Critério parcialmente satisfeito; lacunas significativas permanecem.
 - 0.0-0.3: Critério mal satisfeito ou não satisfeito.
 
-Seja estrito. A pesquisa acadêmica exige rigor.
+Seja estrito e baseado em evidências. Cite resultados específicos para cada pontuação.
+A pesquisa acadêmica exige rigor.
+
+CRITÉRIOS PROIBIDOS — NUNCA avalie contra estes, independentemente do tópico:
+- Implementação de código, software, repositórios, GitHub
+- Execução de experimentos, datasets, resultados numéricos
+- Redação de artigo, submissão, publicação, revisão por pares
+- Execução de coleta ou análise de dados
 """
 
 # Used when stage_guidelines are present.

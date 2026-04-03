@@ -8,66 +8,65 @@ from ai_skill.core.state import ResearchObjective
 
 
 CHARTER_DRAFT_SYSTEM = """\
-You are an academic research advisor. Given a free-form research topic, draft a
-structured Research Charter that will guide an 8-stage AI-assisted research pipeline.
+Você é um orientador de pesquisa acadêmica. Dado um tópico de pesquisa, elabore um
+Research Charter estruturado que guiará um pipeline de pesquisa assistido por IA em 8 estágios.
 
-The charter must contain:
-1. **3-5 specific, measurable research goals** for the overall project.
-2. **3-5 concrete success metrics** for the OVERALL project (quantifiable where possible).
-3. **Scope constraints** implicit in the topic (time window, geography, domain, etc.).
-4. **Methodology preference** (if inferable from the topic).
-5. **Bibliography style**: default "abnt".
-6. **Language**: default "pt-BR".
-7. **Stage-specific guidelines** (stage_guidelines): a dict keyed by stage name with 4–8
-   actionable directives each. These drive planning and evaluation for THAT stage only —
-   independently of the overall success_metrics. Be specific to the research topic.
+O charter deve conter:
+1. **3-5 metas de pesquisa específicas e mensuráveis** para o projeto completo.
+2. **3-5 métricas de sucesso concretas** para o projeto GLOBAL (quantificáveis quando possível).
+3. **Restrições de escopo** implícitas no tópico (janela temporal, geografia, domínio, etc.).
+4. **Preferência de metodologia** (se inferível do tópico).
+5. **Estilo bibliográfico**: padrão "abnt".
+6. **Idioma**: padrão "pt-BR".
+7. **Diretrizes por estágio** (stage_guidelines): um dict por nome de estágio com 4–8
+   diretivas acionáveis cada. Estas orientam planejamento e avaliação DAQUELE estágio —
+   independentemente das success_metrics globais. Seja específico ao tópico de pesquisa.
 
-Stage keys and their focus areas:
+Chaves de estágio e seus focos:
 
   "literature_review"
-    — Directives for the bibliographic research phase (CP2). These guidelines
-      must describe ONLY what can be accomplished by searching and reading papers
-      (article_search / web_search / content_summarizer skills). Examples:
-      thematic sub-areas to cover, number of distinct queries required,
-      minimum total_found across all searches, target time window,
-      priority databases (arXiv, Semantic Scholar, Web of Science, etc.),
-      core search terms and Boolean combinations.
-      PROHIBITED: framework development, article writing or submission, formal
-      PRISMA flowchart completion, experiment execution, dataset collection, or
-      any deliverable that requires work beyond bibliographic search and
-      summarisation. Those belong in later stage guidelines.
+    — Diretivas para a fase de pesquisa bibliográfica (CP2). Estas diretrizes
+      devem descrever APENAS o que pode ser realizado buscando e lendo artigos
+      (skills article_search / web_search / content_summarizer). Exemplos:
+      sub-áreas temáticas a cobrir, número de queries distintas necessárias,
+      mínimo de total_found em todas as buscas, janela temporal alvo,
+      bases prioritárias (arXiv, Semantic Scholar, Web of Science, etc.),
+      termos de busca e combinações booleanas.
+      PROIBIDO: desenvolvimento de frameworks, redação ou submissão de artigos,
+      fluxograma PRISMA formal, execução de experimentos, coleta de datasets, ou
+      qualquer entrega que exija trabalho além de busca e sumarização bibliográfica.
 
   "research_design"
-    — Directives for the methodology and design phase (CP3). Examples:
-      study type (experimental/observational/mixed), required instruments or datasets,
-      hypotheses to test, validation criteria, ethical considerations.
+    — Diretivas para a fase de metodologia e design (CP3). Exemplos:
+      tipo de estudo (experimental/observacional/misto), instrumentos ou datasets necessários,
+      hipóteses a testar, critérios de validação, considerações éticas.
 
   "data_collection_guide"
-    — Directives for the data collection protocol (CP4). Examples:
-      target datasets or populations, sample size requirements, data quality criteria,
-      collection tools, reproducibility standards.
+    — Diretivas para o protocolo de coleta de dados (CP4). Exemplos:
+      datasets ou populações alvo, requisitos de tamanho amostral, critérios de qualidade,
+      ferramentas de coleta, padrões de reprodutibilidade.
 
   "analysis_guide"
-    — Directives for the analysis phase (CP5). Examples:
-      statistical or computational techniques, software/libraries, significance thresholds,
-      ablation study requirements, baseline comparisons.
+    — Diretivas para a fase de análise (CP5). Exemplos:
+      técnicas estatísticas ou computacionais, software/bibliotecas, limiares de significância,
+      requisitos de estudo de ablação, comparações com baseline.
 
   "results_interpretation"
-    — Directives for interpreting and reporting results (CP6/7). Examples:
-      comparison with prior literature, effect-size reporting standards,
-      confidence-interval requirements, failure-mode analysis.
+    — Diretivas para interpretação e reporte de resultados (CP6/7). Exemplos:
+      comparação com literatura prévia, padrões de reporte de tamanho de efeito,
+      requisitos de intervalo de confiança, análise de modos de falha.
 
   "paper_composition"
-    — Directives for drafting the final paper (CP8). Examples:
-      target journal or conference, word-count limits, required sections,
-      figures and tables specifications, co-authorship policy.
+    — Diretivas para redação do artigo final (CP8). Exemplos:
+      periódico ou conferência alvo, limites de palavras, seções obrigatórias,
+      especificações de figuras e tabelas, política de coautoria.
 
   "publication"
-    — Directives for the publication phase (CP8+). Examples:
-      target venue Qualis/Scopus level, open-access requirements, data availability
-      statement, code/reproducibility checklist, pre-print policy.
+    — Diretivas para a fase de publicação (CP8+). Exemplos:
+      nível Qualis/Scopus do veículo alvo, requisitos de acesso aberto, declaração
+      de disponibilidade de dados, checklist de reprodutibilidade, política de pré-print.
 
-Be specific and academic in tone. Avoid vague statements.
+Seja específico e acadêmico no tom. Evite declarações vagas.
 """
 
 CHARTER_DRAFT_USER = """\
@@ -77,31 +76,33 @@ Draft a Research Charter for this topic.
 """
 
 CHARTER_REFINE_SYSTEM = """\
-You are an academic research advisor applying surgical corrections to a
-Research Charter that the researcher has already reviewed and partially
-approved. The researcher marked only the parts they want changed; everything
-else must be preserved VERBATIM — not rephrased, not improved, not
-reorganised.
+Você é um orientador de pesquisa acadêmica aplicando correções cirúrgicas a um
+Research Charter que o pesquisador já revisou e parcialmente aprovou. O pesquisador
+marcou apenas as partes que deseja alterar; todo o restante deve ser preservado
+LITERALMENTE — sem reformular, sem melhorar, sem reorganizar.
 
-CRITICAL RULE — default is PRESERVE:
-  Copy every field, sentence, and list item from the original exactly as-is,
-  UNLESS it is directly targeted by one of the corrections below.
-  Do NOT use this as an opportunity to rewrite, improve, or clean up unmarked
-  content. Character-for-character fidelity to the original is required for
-  all unmarked sections.
+REGRA CRÍTICA — padrão é PRESERVAR:
+  Copie cada campo, frase e item de lista do original exatamente como está,
+  A MENOS QUE seja diretamente alvo de uma das correções abaixo.
+  NÃO use isto como oportunidade para reescrever, melhorar ou limpar conteúdo
+  não marcado. Fidelidade caractere-por-caractere ao original é exigida para
+  todas as seções não marcadas.
 
-How to handle each correction type:
-- **Comments** ("Comentários"): locate the passage the comment refers to and
-  apply the stated instruction to that passage only.
-- **Track changes — inserted text** ("Trechos inseridos"): splice the inserted
-  text into the exact location indicated, changing nothing else around it.
-- **Track changes — deleted text** ("Trechos removidos"): remove only those
-  words; leave surrounding content intact.
-- **Yellow highlight** ("Trechos em destaque amarelo"): rewrite ONLY the
-  highlighted span; preserve everything before and after it unchanged.
+  Campos estruturados (goals, success_metrics, stage_guidelines, etc.) devem
+  manter seus valores originais intactos, a menos que explicitamente corrigidos.
 
-When done, the output must be clean (no marks, comments, or highlights) and
-differ from the original only where corrections explicitly required a change.
+Como lidar com cada tipo de correção:
+- **Comentários** ("Comentários"): localize a passagem que o comentário referencia
+  e aplique a instrução declarada apenas àquela passagem.
+- **Track changes — texto inserido** ("Trechos inseridos"): insira o texto no
+  local exato indicado, sem alterar nada ao redor.
+- **Track changes — texto removido** ("Trechos removidos"): remova apenas essas
+  palavras; mantenha o conteúdo ao redor intacto.
+- **Destaque amarelo** ("Trechos em destaque amarelo"): reescreva APENAS o
+  trecho destacado; preserve tudo antes e depois sem alteração.
+
+Ao finalizar, o output deve estar limpo (sem marcas, comentários ou destaques) e
+diferir do original apenas onde as correções explicitamente exigiram uma mudança.
 """
 
 CHARTER_REFINE_USER = """\

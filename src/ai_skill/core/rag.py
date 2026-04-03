@@ -239,8 +239,15 @@ class RagIndex:
                 self.namespace, len(self._store), self.index_path,
             )
         except Exception as exc:
-            logger.warning(
-                "RagIndex[%s]: could not load %s: %s — starting fresh",
+            logger.error(
+                "RagIndex[%s]: could not load %s: %s — backing up and starting fresh",
                 self.namespace, self.index_path, exc,
             )
+            # Backup corrupt index before discarding
+            try:
+                backup = self.index_path.with_suffix(".json.corrupt")
+                self.index_path.rename(backup)
+                logger.warning("RagIndex[%s]: corrupt index moved to %s", self.namespace, backup)
+            except OSError as rename_exc:
+                logger.warning("RagIndex[%s]: could not backup corrupt index: %s", self.namespace, rename_exc)
             self._store = {}

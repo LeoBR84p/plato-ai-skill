@@ -16,6 +16,7 @@ Parameters accepted in SkillInput.parameters:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -114,9 +115,7 @@ class ContentSummarizerSkill(BaseSkill):
                 client for testing.
         """
         self._llm: LLMClient | None = llm_client
-        self._current_year = int(
-            __import__("datetime").datetime.now().year
-        )
+        self._current_year = datetime.now().year
 
     def _get_llm(self) -> LLMClient:
         """Lazily initialise the LLM client.
@@ -199,7 +198,8 @@ class ContentSummarizerSkill(BaseSkill):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read(65536)
                 html = raw.decode("utf-8", errors="ignore")
-        except Exception:
+        except Exception as exc:
+            logger.warning("_fetch_text: HTTP fetch failed for %s: %s", url, exc)
             html = ""
 
         if html:
@@ -209,7 +209,8 @@ class ContentSummarizerSkill(BaseSkill):
                 for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                     tag.decompose()
                 text = soup.get_text(separator=" ", strip=True)
-            except Exception:
+            except Exception as bs_exc:
+                logger.debug("BeautifulSoup failed, falling back to regex: %s", bs_exc)
                 text = re.sub(r"<[^>]+>", " ", html)
                 text = re.sub(r"\s{2,}", " ", text).strip()
 

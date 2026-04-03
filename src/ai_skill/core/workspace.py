@@ -110,8 +110,11 @@ class ResearchWorkspace:
                 corrupt = self._state_file.with_suffix(".yaml.corrupt")
                 self._state_file.rename(corrupt)
                 logger.warning("Corrupt state file moved to: %s", corrupt)
-            except OSError:
-                pass
+            except OSError as rename_exc:
+                logger.error(
+                    "Could not rename corrupt state file %s: %s — file remains in place",
+                    self._state_file, rename_exc,
+                )
             return None
 
     # ------------------------------------------------------------------

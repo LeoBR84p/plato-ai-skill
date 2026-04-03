@@ -158,7 +158,7 @@ class TavilySearchSkill(BaseSkill):
                 "title": item.get("title", "") or "",
                 "url": url_val,
                 "snippet": item.get("content", "") or "",
-                "score": str(item.get("score", "")),
+                "score": float(item.get("score", 0.0) or 0.0),
                 "published_date": item.get("published_date", "") or "",
                 "source": "tavily",
             })

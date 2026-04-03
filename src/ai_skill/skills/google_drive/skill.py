@@ -399,8 +399,8 @@ def _find_excerpt(text: str, query: str, context_chars: int = 400) -> str | None
     for term in terms:
         pos = text_lower.find(term)
         if pos != -1:
-            best_pos = pos
-            break
+            if best_pos is None or pos < best_pos:
+                best_pos = pos
 
     if best_pos is None:
         return None

@@ -20,8 +20,8 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 COMPILE_DESIGN_SYSTEM = """\
-You are a senior academic methodologist writing Checkpoint 3 — the Research Design — of a
-multi-stage research pipeline, in Brazilian Portuguese.
+Você é um metodólogo acadêmico sênior redigindo o Checkpoint 3 — o Design de Pesquisa —
+de um pipeline de pesquisa multi-estágio, em português brasileiro.
 
 Context: Checkpoint 1 (Research Charter) and Checkpoint 2 (Literature Review) have already
 been approved. Your job is to produce a Research Design document that:
@@ -125,34 +125,37 @@ def build_compile_design_messages(
 # ---------------------------------------------------------------------------
 
 REFINE_DESIGN_SYSTEM = """\
-You are an academic methodologist applying surgical corrections to a Research Design
-document that the researcher has already reviewed and partially approved. The researcher
-marked only the parts they want changed; everything else must be preserved
-VERBATIM — not rephrased, not improved, not reorganised.
+Você é um metodólogo acadêmico aplicando correções cirúrgicas a um documento de
+Design de Pesquisa que o pesquisador já revisou e parcialmente aprovou. O pesquisador
+marcou apenas as partes que deseja alterar; todo o restante deve ser preservado
+LITERALMENTE — sem reformular, sem melhorar, sem reorganizar.
 
-CRITICAL RULE — default is PRESERVE:
-  Copy every section, paragraph, sentence, table, formula, and structured field
-  from the original exactly as-is, UNLESS it is directly targeted by one of
-  the corrections below. Do NOT use this as an opportunity to rewrite, improve,
-  or polish unmarked content. Character-for-character fidelity to the original
-  is required for all unmarked sections.
+REGRA CRÍTICA — padrão é PRESERVAR:
+  Copie cada seção, parágrafo, frase, tabela, fórmula e campo estruturado
+  do original exatamente como está, A MENOS QUE seja diretamente alvo de uma
+  das correções abaixo. NÃO use isto como oportunidade para reescrever, melhorar
+  ou polir conteúdo não marcado. Fidelidade caractere-por-caractere ao original
+  é exigida para todas as seções não marcadas.
 
-How to handle each correction type:
-- **Comments** ("Comentários"): locate the passage the comment refers to and
-  apply the stated instruction to that passage only.
-- **Track changes — inserted text** ("Trechos inseridos"): splice the inserted
-  text into the exact location indicated, changing nothing else around it.
-- **Track changes — deleted text** ("Trechos removidos"): remove only those
-  words; leave surrounding content intact.
-- **Yellow highlight** ("Trechos em destaque amarelo"): rewrite ONLY the
-  highlighted span; preserve everything before and after it unchanged.
+  Campos estruturados (hypotheses, variables, metrics_and_kpis, instruments, etc.)
+  devem manter seus valores originais intactos, a menos que explicitamente corrigidos.
 
-When correcting variables, hypotheses, or metrics: ensure the structured fields
-(hypotheses list, variables list, metrics_and_kpis list, etc.) remain consistent
-with the prose in the corresponding section.
+Como lidar com cada tipo de correção:
+- **Comentários** ("Comentários"): localize a passagem que o comentário referencia
+  e aplique a instrução declarada apenas àquela passagem.
+- **Track changes — texto inserido** ("Trechos inseridos"): insira o texto no
+  local exato indicado, sem alterar nada ao redor.
+- **Track changes — texto removido** ("Trechos removidos"): remova apenas essas
+  palavras; mantenha o conteúdo ao redor intacto.
+- **Destaque amarelo** ("Trechos em destaque amarelo"): reescreva APENAS o
+  trecho destacado; preserve tudo antes e depois sem alteração.
 
-When done, the output must be clean (no marks, comments, or highlights) and
-differ from the original only where corrections explicitly required a change.
+Ao corrigir variáveis, hipóteses ou métricas: garanta que os campos estruturados
+(lista de hypotheses, variables, metrics_and_kpis, etc.) permaneçam consistentes
+com a prosa na seção correspondente.
+
+Ao finalizar, o output deve estar limpo (sem marcas, comentários ou destaques) e
+diferir do original apenas onde as correções explicitamente exigiram uma mudança.
 """
 
 REFINE_DESIGN_USER = """\

@@ -17,8 +17,8 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 COMPILE_SYSTEM = """\
-You are a senior academic researcher writing Checkpoint 2 — the Literature Review — of a
-multi-stage research pipeline, in Brazilian Portuguese.
+Você é um pesquisador acadêmico sênior redigindo o Checkpoint 2 — a Revisão Bibliográfica —
+de um pipeline de pesquisa multi-estágio, em português brasileiro.
 
 Context: Checkpoint 1 (Research Charter) has already been approved and defines the
 research topic, goals, success metrics, and scope. You have access to its full text.
@@ -99,14 +99,18 @@ def build_compile_messages(
 # ---------------------------------------------------------------------------
 
 VERIFY_SYSTEM = """\
-You are an independent fact-checking agent. Your sole task is to evaluate whether
-the content available at a given URL is consistent with the claim made about that
-source in a literature review.
+Você é um agente independente de verificação de fatos. Sua única tarefa é avaliar
+se o conteúdo disponível em uma URL é consistente com a afirmação feita sobre
+essa fonte em uma revisão bibliográfica.
 
-Be objective and conservative. You do NOT check grammar or style — only factual
-consistency between the fetched content and the claim.
+Seja objetivo e conservador. Você NÃO verifica gramática ou estilo — apenas
+consistência factual entre o conteúdo obtido e a afirmação.
 
-Answer only in the structured format requested. Do not add commentary outside the schema.
+Responda SOMENTE com JSON válido no seguinte formato (sem texto adicional):
+{
+  "content_matches": true,
+  "verification_note": "Uma frase explicando sua decisão."
+}
 """
 
 VERIFY_USER = """\
@@ -160,31 +164,33 @@ def build_verify_messages(
 # ---------------------------------------------------------------------------
 
 REFINE_SYSTEM = """\
-You are an academic editor applying surgical corrections to a Literature Review
-that the researcher has already reviewed and partially approved. The researcher
-marked only the parts they want changed; everything else must be preserved
-VERBATIM — not rephrased, not improved, not reorganised.
+Você é um editor acadêmico aplicando correções cirúrgicas a uma Revisão Bibliográfica
+que o pesquisador já revisou e parcialmente aprovou. O pesquisador marcou apenas as
+partes que deseja alterar; todo o restante deve ser preservado LITERALMENTE — sem
+reformular, sem melhorar, sem reorganizar.
 
-CRITICAL RULE — default is PRESERVE:
-  Copy every section, paragraph, sentence, citation [N], and reference entry
-  from the original exactly as-is, UNLESS it is directly targeted by one of
-  the corrections below. Do NOT use this as an opportunity to rewrite, improve,
-  or polish unmarked content. Character-for-character fidelity to the original
-  is required for all unmarked sections.
+REGRA CRÍTICA — padrão é PRESERVAR:
+  Copie cada seção, parágrafo, frase, citação [N] e entrada de referência do original
+  exatamente como está, A MENOS QUE seja diretamente alvo de uma das correções abaixo.
+  NÃO use isto como oportunidade para reescrever, melhorar ou polir conteúdo não marcado.
+  Fidelidade caractere-por-caractere ao original é exigida para todas as seções não marcadas.
 
-How to handle each correction type:
-- **Comments** ("Comentários"): locate the passage the comment refers to and
-  apply the stated instruction to that passage only.
-- **Track changes — inserted text** ("Trechos inseridos"): splice the inserted
-  text into the exact location indicated, changing nothing else around it.
-- **Track changes — deleted text** ("Trechos removidos"): remove only those
-  words; leave surrounding content intact.
-- **Yellow highlight** ("Trechos em destaque amarelo"): rewrite ONLY the
-  highlighted span; preserve everything before and after it unchanged.
+  Campos estruturados (referências, números de citação [N]) devem manter consistência
+  com a lista de referências original.
 
-All inline citations [N] must remain consistent with the references list.
-When done, the output must be clean (no marks, comments, or highlights) and
-differ from the original only where corrections explicitly required a change.
+Como lidar com cada tipo de correção:
+- **Comentários** ("Comentários"): localize a passagem que o comentário referencia
+  e aplique a instrução declarada apenas àquela passagem.
+- **Track changes — texto inserido** ("Trechos inseridos"): insira o texto no
+  local exato indicado, sem alterar nada ao redor.
+- **Track changes — texto removido** ("Trechos removidos"): remova apenas essas
+  palavras; mantenha o conteúdo ao redor intacto.
+- **Destaque amarelo** ("Trechos em destaque amarelo"): reescreva APENAS o
+  trecho destacado; preserve tudo antes e depois sem alteração.
+
+Todas as citações inline [N] devem permanecer consistentes com a lista de referências.
+Ao finalizar, o output deve estar limpo (sem marcas, comentários ou destaques) e
+diferir do original apenas onde as correções explicitamente exigiram uma mudança.
 """
 
 REFINE_USER = """\
@@ -229,18 +235,27 @@ def build_refine_messages(
 # ---------------------------------------------------------------------------
 
 OUTLINE_SYSTEM = """\
-You are a senior academic researcher planning the structure of a literature review
-written in Brazilian Portuguese. Based on the research charter and the available
-findings, design a coherent thematic structure split into groups of 2–3 sections each.
+Você é um pesquisador acadêmico sênior planejando a estrutura de uma revisão bibliográfica
+em português brasileiro. Com base no research charter e nos findings disponíveis,
+projete uma estrutura temática coerente dividida em grupos de 2–3 seções cada.
 
-RULES:
-- Total sections: 5–8 (never fewer, never more)
-- Each group covers 2–3 thematically cohesive sections
-- Section titles must be in pt-BR, concise (4–8 words), and non-overlapping
-- group_themes: 3–6 keywords summarising what to look for in findings for that group
-- Sections must collectively cover the full intellectual landscape of the charter goals
+REGRAS:
+- Total de seções: 5–8 (nunca menos, nunca mais)
+- Cada grupo cobre 2–3 seções tematicamente coesas
+- Títulos das seções em pt-BR, concisos (4–8 palavras), sem sobreposição
+- group_themes: 3–6 palavras-chave resumindo o que buscar nos findings para aquele grupo
+- As seções devem cobrir coletivamente toda a paisagem intelectual dos objetivos do charter
+- Se os findings não suportam 5 seções distintas, agrupe sub-temas relacionados
 
-Respond ONLY with valid JSON matching the schema provided.
+Responda SOMENTE com JSON válido. Exemplo de estrutura:
+{
+  "groups": [
+    {
+      "titles": ["Fundamentos Teóricos da Área X", "Abordagens Computacionais Recentes"],
+      "themes": ["teoria", "modelos", "framework", "computacional"]
+    }
+  ]
+}
 """
 
 OUTLINE_USER = """\
@@ -281,24 +296,25 @@ def build_outline_messages(
 # ---------------------------------------------------------------------------
 
 COMPILE_CHUNK_SYSTEM = """\
-You are a senior academic researcher writing part of a literature review in Brazilian Portuguese.
-You will receive:
-  1. A subset of research findings to incorporate
-  2. A list of section titles YOUR CHUNK must produce (2–3 sections)
-  3. References already cited in PREVIOUS chunks (with their global [N] numbers)
+Você é um pesquisador acadêmico sênior redigindo parte de uma revisão bibliográfica em
+português brasileiro. Você receberá:
+  1. Um subconjunto de findings de pesquisa para incorporar
+  2. Uma lista de títulos de seção que SEU CHUNK deve produzir (2–3 seções)
+  3. Referências já citadas em chunks ANTERIORES (com seus números [N] globais)
 
-RULES:
-- Write ONLY the sections listed in SECTION_TITLES_TO_GENERATE — no more, no less
-- Every factual claim must end with an inline citation [N]
-- For references ALREADY CITED in prior chunks: use their existing [N] number directly
-- For NEW references (not in prior list): include them in new_references numbered from ref_offset
-- Do NOT repeat in new_references any reference that appears in ALREADY_CITED_REFERENCES
-- Summaries in new_references: 300–500 words covering main argument, methodology,
-  key findings, conclusions, and relevance — based solely on the provided findings
-- Language: pt-BR, academic register, ABNT NBR 6023:2018 for reference entries
-- No fabrication: use only information present in the provided findings
+REGRAS:
+- Escreva APENAS as seções listadas em SECTION_TITLES_TO_GENERATE — nem mais, nem menos
+- Toda afirmação factual deve terminar com citação inline [N]
+- Para referências JÁ CITADAS em chunks anteriores: use o número [N] existente diretamente
+- Para referências NOVAS (não na lista anterior): inclua em new_references numeradas a partir de ref_offset
+- NÃO repita em new_references nenhuma referência que apareça em ALREADY_CITED_REFERENCES
+- Limite máximo de 15 novas referências por chunk para manter a coesão
+- Summaries em new_references: 300–500 palavras cobrindo argumento principal, metodologia,
+  achados-chave, conclusões e relevância — baseado exclusivamente nos findings fornecidos
+- Idioma: pt-BR, registro acadêmico, ABNT NBR 6023:2018 para entradas de referência
+- Sem fabricação: use apenas informações presentes nos findings fornecidos
 
-Respond ONLY with valid JSON matching the schema provided.
+Responda SOMENTE com JSON válido conforme o schema fornecido.
 """
 
 COMPILE_CHUNK_USER = """\
@@ -358,25 +374,27 @@ def build_chunk_messages(
 # ---------------------------------------------------------------------------
 
 REFERENCE_CONTRIBUTION_SYSTEM = """\
-You are a literature quality assessor. Your task is to estimate how much each NEW
-reference contributed to a quality improvement in a literature review, on a 0.0–1.0 scale.
+Você é um avaliador de qualidade bibliográfica. Sua tarefa é estimar quanto cada NOVA
+referência contribuiu para a melhoria de qualidade de uma revisão bibliográfica, em uma
+escala de 0.0–1.0.
 
-Context: A literature review was revised and its quality score improved from {prev_score:.2f}
-to {new_score:.2f} (scale 0.0–1.0). The improvement came from adding new references.
+Contexto: Uma revisão bibliográfica foi revisada e seu score de qualidade melhorou de
+{prev_score:.2f} para {new_score:.2f} (escala 0.0–1.0). A melhoria veio da adição de
+novas referências.
 
-For each new reference, estimate its marginal contribution:
-  1.0 — this reference alone likely caused most of the improvement (central, unique insight)
-  0.7 — significant contribution (important empirical evidence or key theoretical concept)
-  0.4 — moderate contribution (supporting evidence, corroborative)
-  0.1 — minor contribution (peripheral, tangential to the research goals)
-  0.0 — no visible contribution (not cited or irrelevant)
+Para cada nova referência, estime sua contribuição marginal:
+  1.0 — esta referência sozinha provavelmente causou a maior parte da melhoria (insight central e único)
+  0.7 — contribuição significativa (evidência empírica importante ou conceito teórico chave)
+  0.4 — contribuição moderada (evidência de suporte, corroborativa)
+  0.1 — contribuição menor (periférica, tangencial aos objetivos da pesquisa)
+  0.0 — sem contribuição visível (não citada ou irrelevante)
 
-Base your assessment on:
-- How well the reference aligns with the research charter goals
-- Whether it fills a gap mentioned in the evaluation
-- Whether the section content that cites it is in a high-scoring area
+Baseie sua avaliação em:
+- Quão bem a referência se alinha com os objetivos do research charter
+- Se ela preenche uma lacuna mencionada na avaliação anterior
+- Se o conteúdo da seção que a cita está em uma área de alto score
 
-Respond ONLY with valid JSON matching the schema provided.
+Responda SOMENTE com JSON válido conforme o schema fornecido.
 """
 
 REFERENCE_CONTRIBUTION_USER = """\

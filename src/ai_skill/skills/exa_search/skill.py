@@ -190,7 +190,7 @@ class ExaSearchSkill(BaseSkill):
                 "title": getattr(item, "title", "") or "",
                 "url": getattr(item, "url", "") or "",
                 "snippet": snippet,
-                "score": str(getattr(item, "score", "")),
+                "score": float(getattr(item, "score", 0.0) or 0.0),
                 "published_date": getattr(item, "published_date", "") or "",
                 "source": "exa",
             }
